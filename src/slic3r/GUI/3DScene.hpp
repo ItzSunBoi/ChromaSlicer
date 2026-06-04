@@ -13,10 +13,12 @@
 #include "libslic3r/ObjectID.hpp"
 
 #include "GLModel.hpp"
+#include "GLTexture.hpp"
 #include "GLShader.hpp"
 #include "MeshUtils.hpp"
 
 #include <functional>
+#include <memory>
 #include <optional>
 
 #ifndef NDEBUG
@@ -77,6 +79,29 @@ struct ObjectFilamentResults {
 
 // Return appropriate color based on the ModelVolume.
 extern ColorRGBA color_from_model_volume(const ModelVolume& model_volume);
+
+struct GLFullColorPreviewData
+{
+    bool has_full_color    = false;
+    bool has_uv_debug      = false;
+    bool has_face_colors   = false;
+    bool has_vertex_colors = false;
+    bool has_textures      = false;
+
+    size_t triangle_count       = 0;
+    size_t texture_count        = 0;
+    size_t loaded_texture_count = 0;
+    size_t preview_model_count  = 0;
+    size_t textured_triangle_count = 0;
+};
+
+struct GLFullColorTexturePreview
+{
+    GUI::GLModel           model;
+    GUI::GLModel::Geometry geometry;
+    GUI::GLTexture         texture;
+    size_t                 triangle_count = 0;
+};
 
 class GLVolume {
 public:
@@ -232,6 +257,10 @@ public:
     mutable std::vector<GUI::GLModel> mmuseg_models;
     mutable ObjectBase::Timestamp       mmuseg_ts;
 
+    GLFullColorPreviewData    full_color_preview;
+    std::vector<GUI::GLModel> full_color_preview_models;
+    std::vector<std::unique_ptr<GLFullColorTexturePreview>> full_color_texture_preview_models;
+
     // Ranges of triangle and quad indices to be rendered.
     std::pair<size_t, size_t>   tverts_range;
 
@@ -348,7 +377,7 @@ public:
     virtual void render_with_outline(const GUI::Size& cnv_size);
 
     //BBS: add simple render function for thumbnail
-    void simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_objects, std::vector<ColorRGBA>& extruder_colors, bool ban_light =false);
+    void simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_objects, std::vector<ColorRGBA>& extruder_colors, bool ban_light = false, bool allow_full_color_preview = false);
 
     void                set_bounding_boxes_as_dirty() {
         m_transformed_bounding_box.reset();

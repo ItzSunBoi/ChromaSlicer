@@ -11,6 +11,7 @@
 #include "libslic3r/BuildVolume.hpp"
 #include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/ExtrusionEntityCollection.hpp"
+#include "libslic3r/FullColor/FullColorSurfaceData.hpp"
 #include "libslic3r/Geometry.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/SLAPrint.hpp"
@@ -27,6 +28,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+
+#include <map>
 
 #include <boost/log/trivial.hpp>
 
@@ -84,6 +87,179 @@ Slic3r::ColorRGBA adjust_color_for_rendering(const Slic3r::ColorRGBA &colors)
 }
 
 namespace Slic3r {
+
+static constexpr int FULL_COLOR_PREVIEW_UV_BINS = 16;
+
+static ColorRGBA full_color_preview_color(const RGBA &color)
+{
+    return ColorRGBA(color[0], color[1], color[2], color[3]);
+}
+
+static unsigned char full_color_preview_quantize(float value, int bins = 256)
+{
+    return static_cast<unsigned char>(std::clamp(value, 0.0f, 1.0f) * static_cast<float>(bins - 1) + 0.5f);
+}
+
+static ColorRGBA full_color_preview_uv_color(const Vec2f &uv)
+{
+    const float r = full_color_preview_quantize(uv.x(), FULL_COLOR_PREVIEW_UV_BINS) / static_cast<float>(FULL_COLOR_PREVIEW_UV_BINS - 1);
+    const float g = full_color_preview_quantize(uv.y(), FULL_COLOR_PREVIEW_UV_BINS) / static_cast<float>(FULL_COLOR_PREVIEW_UV_BINS - 1);
+    return ColorRGBA(r, g, 0.0f, 1.0f);
+}
+
+static uint32_t full_color_preview_color_key(const ColorRGBA &color)
+{
+    const uint32_t r = full_color_preview_quantize(color.r());
+    const uint32_t g = full_color_preview_quantize(color.g());
+    const uint32_t b = full_color_preview_quantize(color.b());
+    const uint32_t a = full_color_preview_quantize(color.a());
+    return (r << 24) | (g << 16) | (b << 8) | a;
+}
+
+struct FullColorPreviewBatch
+{
+    ColorRGBA color;
+    GUI::GLModel::Geometry geometry;
+};
+
+static void init_full_color_preview(GLVolume &gl_volume, const ModelVolume &model_volume, bool opengl_initialized)
+{
+    const std::shared_ptr<FullColor::SurfaceData> &surface_data = model_volume.full_color_data;
+    if (!surface_data || surface_data->empty())
+        return;
+
+    GLFullColorPreviewData &preview = gl_volume.full_color_preview;
+    preview.has_full_color           = true;
+    preview.has_face_colors          = surface_data->has_face_colors;
+    preview.has_vertex_colors        = surface_data->has_vertex_colors;
+    preview.has_textures             = surface_data->has_textures;
+    preview.triangle_count           = surface_data->triangles.size();
+    preview.texture_count            = surface_data->textures.size();
+
+    const indexed_triangle_set &mesh = model_volume.mesh().its;
+    if (surface_data->triangles.size() != mesh.indices.size()) {
+        BOOST_LOG_TRIVIAL(warning) << "FullColor viewport: triangle count mismatch, metadata=" << surface_data->triangles.size()
+                                   << ", mesh=" << mesh.indices.size() << "; using normal rendering";
+        return;
+    }
+
+    std::vector<std::unique_ptr<GLFullColorTexturePreview>> texture_previews(surface_data->textures.size());
+    if (opengl_initialized) {
+        for (size_t texture_idx = 0; texture_idx < surface_data->textures.size(); ++texture_idx) {
+            const FullColor::TextureImage &texture_data = surface_data->textures[texture_idx];
+            auto texture_preview = std::make_unique<GLFullColorTexturePreview>();
+            const std::string texture_path = texture_data.source_path.string();
+            if (!texture_path.empty() && texture_preview->texture.load_from_file(texture_path, true, GUI::GLTexture::None, true)) {
+                texture_previews[texture_idx] = std::move(texture_preview);
+                ++preview.loaded_texture_count;
+            } else {
+                BOOST_LOG_TRIVIAL(warning) << "FullColor viewport: failed to load texture '" << texture_path << "'";
+            }
+        }
+    }
+
+    std::map<uint32_t, FullColorPreviewBatch> batches;
+    for (size_t triangle_idx = 0; triangle_idx < mesh.indices.size(); ++triangle_idx) {
+        const FullColor::TriangleColorData &triangle_data = surface_data->triangles[triangle_idx];
+        const stl_triangle_vertex_indices &indices = mesh.indices[triangle_idx];
+
+        if (triangle_data.has_uv && triangle_data.texture_index >= 0 &&
+            static_cast<size_t>(triangle_data.texture_index) < texture_previews.size() &&
+            texture_previews[triangle_data.texture_index]) {
+            GLFullColorTexturePreview &texture_preview = *texture_previews[triangle_data.texture_index];
+            GUI::GLModel::Geometry &geometry = texture_preview.geometry;
+            if (geometry.vertices.empty())
+                geometry.format = {GUI::GLModel::Geometry::EPrimitiveType::Triangles, GUI::GLModel::Geometry::EVertexLayout::P3N3T2};
+
+            const stl_vertex vertex[3] = {mesh.vertices[indices[0]], mesh.vertices[indices[1]], mesh.vertices[indices[2]]};
+            const stl_vertex normal    = face_normal_normalized(vertex);
+            const unsigned int base    = static_cast<unsigned int>(geometry.vertices_count());
+            for (size_t corner = 0; corner < 3; ++corner) {
+                const Vec2f uv(triangle_data.uv[corner].x(), 1.0f - triangle_data.uv[corner].y());
+                geometry.add_vertex(vertex[corner], normal, uv);
+            }
+            geometry.add_triangle(base, base + 1, base + 2);
+            ++texture_preview.triangle_count;
+            ++preview.textured_triangle_count;
+            continue;
+        }
+
+        ColorRGBA color;
+        bool has_preview_color = false;
+
+        if (triangle_data.has_uv) {
+            const Vec2f uv = (triangle_data.uv[0] + triangle_data.uv[1] + triangle_data.uv[2]) / 3.0f;
+            color = full_color_preview_uv_color(uv);
+            preview.has_uv_debug = true;
+            has_preview_color    = true;
+        } else if (triangle_data.has_color) {
+            color             = full_color_preview_color(triangle_data.fallback_color);
+            has_preview_color = true;
+        } else if (surface_data->has_vertex_colors) {
+            const stl_triangle_vertex_indices &indices = mesh.indices[triangle_idx];
+            if (static_cast<size_t>(indices[0]) < surface_data->vertex_colors.size() &&
+                static_cast<size_t>(indices[1]) < surface_data->vertex_colors.size() &&
+                static_cast<size_t>(indices[2]) < surface_data->vertex_colors.size()) {
+                RGBA average_color{0.0f, 0.0f, 0.0f, 0.0f};
+                for (size_t corner = 0; corner < 3; ++corner)
+                    for (size_t channel = 0; channel < 4; ++channel)
+                        average_color[channel] += surface_data->vertex_colors[indices[corner]][channel] / 3.0f;
+                color             = full_color_preview_color(average_color);
+                has_preview_color = true;
+            }
+        }
+
+        if (!has_preview_color) {
+            gl_volume.full_color_preview_models.clear();
+            BOOST_LOG_TRIVIAL(warning) << "FullColor viewport: incomplete color metadata at triangle " << triangle_idx
+                                       << "; using normal rendering";
+            return;
+        }
+
+        FullColorPreviewBatch &batch = batches[full_color_preview_color_key(color)];
+        if (batch.geometry.vertices.empty()) {
+            batch.color           = color;
+            batch.geometry.format = {GUI::GLModel::Geometry::EPrimitiveType::Triangles, GUI::GLModel::Geometry::EVertexLayout::P3N3};
+        }
+
+        const stl_vertex vertex[3] = {mesh.vertices[indices[0]], mesh.vertices[indices[1]], mesh.vertices[indices[2]]};
+        const stl_vertex normal    = face_normal_normalized(vertex);
+        const unsigned int base    = static_cast<unsigned int>(batch.geometry.vertices_count());
+        for (const stl_vertex &v : vertex)
+            batch.geometry.add_vertex(v, normal);
+        batch.geometry.add_triangle(base, base + 1, base + 2);
+    }
+
+    for (std::unique_ptr<GLFullColorTexturePreview> &texture_preview : texture_previews) {
+        if (!texture_preview || texture_preview->triangle_count == 0)
+            continue;
+
+        texture_preview->model.init_from(std::move(texture_preview->geometry));
+        gl_volume.full_color_texture_preview_models.emplace_back(std::move(texture_preview));
+    }
+
+    gl_volume.full_color_preview_models.reserve(batches.size());
+    for (auto &entry : batches) {
+        FullColorPreviewBatch &batch = entry.second;
+        if (batch.geometry.is_empty())
+            continue;
+
+        batch.geometry.color = batch.color;
+        gl_volume.full_color_preview_models.emplace_back();
+        gl_volume.full_color_preview_models.back().init_from(std::move(batch.geometry));
+    }
+    preview.preview_model_count = gl_volume.full_color_texture_preview_models.size() + gl_volume.full_color_preview_models.size();
+
+    BOOST_LOG_TRIVIAL(warning) << "FullColor viewport: payload detected, triangles=" << preview.triangle_count
+                               << ", textures=" << preview.texture_count
+                               << ", loaded_textures=" << preview.loaded_texture_count
+                               << ", uv_debug=" << preview.has_uv_debug
+                               << ", textured_triangles=" << preview.textured_triangle_count
+                               << ", preview_triangles=" << mesh.indices.size()
+                               << ", texture_preview_models=" << gl_volume.full_color_texture_preview_models.size()
+                               << ", color_preview_models=" << gl_volume.full_color_preview_models.size()
+                               << ", preview_models=" << preview.preview_model_count;
+}
 
 
 const float GLVolume::SinkingContours::HalfWidth = 0.25f;
@@ -473,7 +649,7 @@ void GLVolume::render()
     ModelObjectPtrs &model_objects = GUI::wxGetApp().model().objects;
     std::vector<ColorRGBA> colors = GUI::wxGetApp().plater()->get_extruders_colors();
 
-    simple_render(shader, model_objects, colors);
+    simple_render(shader, model_objects, colors, false, true);
 }
 
 //BBS: add outline related logic
@@ -492,7 +668,7 @@ void GLVolume::render_with_outline(const GUI::Size& cnv_size)
     const GUI::OpenGLManager::EFramebufferType framebuffers_type = GUI::OpenGLManager::get_framebuffers_type();
     if (framebuffers_type == GUI::OpenGLManager::EFramebufferType::Unknown) {
         // No supported, degrade to normal rendering
-        simple_render(shader, model_objects, colors);
+        simple_render(shader, model_objects, colors, false, true);
         return;
     }
 
@@ -546,7 +722,7 @@ void GLVolume::render_with_outline(const GUI::Size& cnv_size)
     glActiveTexture(GL_TEXTURE0);
     glsafe(::glBindTexture(GL_TEXTURE_2D, depth_tex));
     shader->set_uniform("depth_tex", 0);
-    simple_render(shader, model_objects, colors);
+    simple_render(shader, model_objects, colors, false, true);
 
     // Some clean up to do
     glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
@@ -565,8 +741,11 @@ void GLVolume::render_with_outline(const GUI::Size& cnv_size)
 }
 
 //BBS add render for simple case
-void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_objects, std::vector<ColorRGBA>& extruder_colors, bool ban_light)
+void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_objects, std::vector<ColorRGBA>& extruder_colors, bool ban_light, bool allow_full_color_preview)
 {
+    if (shader != nullptr)
+        shader->set_uniform("use_texture", false);
+
     if (this->is_left_handed())
         glFrontFace(GL_CW);
     glsafe(::glCullFace(GL_BACK));
@@ -599,7 +778,24 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
         }
     } while (0);
 
-    if (color_volume && !picking) {
+    if (allow_full_color_preview && !picking && (!full_color_texture_preview_models.empty() || !full_color_preview_models.empty())) {
+        if (shader != nullptr && !full_color_texture_preview_models.empty()) {
+            shader->set_uniform("uniform_texture", 0);
+            shader->set_uniform("use_texture", true);
+            glsafe(::glActiveTexture(GL_TEXTURE0));
+            for (std::unique_ptr<GLFullColorTexturePreview> &preview : full_color_texture_preview_models) {
+                if (!preview || !preview->model.is_initialized() || preview->texture.get_id() == 0)
+                    continue;
+
+                glsafe(::glBindTexture(GL_TEXTURE_2D, preview->texture.get_id()));
+                preview->model.render(shader);
+            }
+            glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
+            shader->set_uniform("use_texture", false);
+        }
+        for (GUI::GLModel &preview_model : full_color_preview_models)
+            preview_model.render(shader);
+    } else if (color_volume && !picking) {
         // when force_transparent, we need to keep the alpha
         if (force_native_color && render_color.is_transparent()) {
             for (auto &extruder_color : extruder_colors)
@@ -765,6 +961,7 @@ int GLVolumeCollection::load_object_volume(
     v.model.init_from(*mesh);
     if (need_raycaster) { v.mesh_raycaster = std::make_unique<GUI::MeshRaycaster>(mesh); }
 #endif // ENABLE_SMOOTH_NORMALS
+    init_full_color_preview(v, *model_volume, opengl_initialized);
     v.composite_id = GLVolume::CompositeID(obj_idx, volume_idx, instance_idx);
 
     if (model_volume->is_model_part())

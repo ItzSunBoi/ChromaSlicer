@@ -29,6 +29,8 @@ struct SlopeDetection
 };
 
 uniform vec4 uniform_color;
+uniform bool use_texture;
+uniform sampler2D uniform_texture;
 uniform bool use_color_clip_plane;
 uniform vec4 uniform_color_clip_plane_1;
 uniform vec4 uniform_color_clip_plane_2;
@@ -59,6 +61,7 @@ varying vec2 intensity;
 varying vec4 world_pos;
 varying float world_normal_z;
 varying vec3 eye_normal;
+varying vec2 tex_coord;
 
 vec3 getBackfaceColor(vec3 fill) {
     float brightness = 0.2126 * fill.r + 0.7152 * fill.g + 0.0722 * fill.b;
@@ -137,6 +140,9 @@ void main()
     }
     else
 	    color = uniform_color;
+
+    if (use_texture)
+        color = texture2D(uniform_texture, tex_coord);
 
     if (slope.actived) {
          if(world_pos.z<0.1&&world_pos.z>-0.1)
