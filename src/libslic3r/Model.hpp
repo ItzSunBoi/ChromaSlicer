@@ -49,6 +49,10 @@ namespace cereal {
 namespace Slic3r {
 enum class ConversionType;
 
+namespace FullColor {
+struct SurfaceData;
+}
+
 class BuildVolume;
 class Model;
 class ModelInstance;
@@ -814,6 +818,7 @@ public:
         }
     };
     Source              source;
+    std::shared_ptr<FullColor::SurfaceData> full_color_data;
 
     // struct used by cut command 
     // It contains information about connetors
@@ -1106,7 +1111,7 @@ private:
     // Copying an existing volume, therefore this volume will get a copy of the ID assigned.
     ModelVolume(ModelObject *object, const ModelVolume &other) :
         ObjectBase(other),
-        name(other.name), source(other.source), m_mesh(other.m_mesh), m_convex_hull(other.m_convex_hull),
+        name(other.name), source(other.source), full_color_data(other.full_color_data), m_mesh(other.m_mesh), m_convex_hull(other.m_convex_hull),
         config(other.config), m_type(other.m_type), object(object), m_transformation(other.m_transformation),
         supported_facets(other.supported_facets), seam_facets(other.seam_facets), mmu_segmentation_facets(other.mmu_segmentation_facets),
         fuzzy_skin_facets(other.fuzzy_skin_facets), cut_info(other.cut_info), text_configuration(other.text_configuration), emboss_shape(other.emboss_shape)

@@ -1295,6 +1295,7 @@ ModelVolume* ModelObject::add_volume(const ModelVolume &other, TriangleMesh &&me
 ModelVolume* ModelObject::add_volume_with_shared_mesh(const ModelVolume &other, ModelVolumeType type /*= ModelVolumeType::INVALID*/)
 {
     ModelVolume* v = new ModelVolume(this, other.m_mesh);
+    v->full_color_data = other.full_color_data;
     if (type != ModelVolumeType::INVALID && v->type() != type)
         v->set_type(type);
     this->volumes.push_back(v);

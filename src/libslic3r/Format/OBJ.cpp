@@ -1,6 +1,8 @@
 #include "../libslic3r.h"
 #include "../Model.hpp"
 #include "../TriangleMesh.hpp"
+#include "../FullColor/ObjColorConvert.hpp"
+#include "../FullColor/FullColorSurfaceData.hpp"
 
 #include "OBJ.hpp"
 #include "objparser.hpp"
@@ -137,7 +139,23 @@ bool load_obj(const char *path, TriangleMesh *meshptr, ObjInfo& obj_info, std::s
                 its.indices.emplace_back(indices[0], indices[1], indices[2]);
                 int  face_index =its.indices.size() - 1;
                 RGBA face_color;
-                auto set_face_color = [&uvs, &data, &mtl_data, &obj_info, &face_color](int face_index, const std::string mtl_name) {
+                auto add_face_uv = [&uvs, &data, &obj_info](const std::array<int, 3> &uv_indices) {
+                    const auto valid_uv_index = [&uvs, &data](int corner_index) {
+                        const int uv_index = uvs[corner_index];
+                        return uv_index >= 0 && static_cast<size_t>(uv_index) * 2 + 1 < data.textureCoordinates.size();
+                    };
+                    if (valid_uv_index(uv_indices[0]) && valid_uv_index(uv_indices[1]) && valid_uv_index(uv_indices[2])) {
+                        const int uv0 = uvs[uv_indices[0]];
+                        const int uv1 = uvs[uv_indices[1]];
+                        const int uv2 = uvs[uv_indices[2]];
+                        obj_info.uvs.emplace_back(std::array<Vec2f, 3>{
+                            Vec2f(data.textureCoordinates[uv0 * 2], data.textureCoordinates[uv0 * 2 + 1]),
+                            Vec2f(data.textureCoordinates[uv1 * 2], data.textureCoordinates[uv1 * 2 + 1]),
+                            Vec2f(data.textureCoordinates[uv2 * 2], data.textureCoordinates[uv2 * 2 + 1])});
+                    }
+                };
+                auto set_face_color = [&mtl_data, &obj_info, &face_color](int face_index, const std::string mtl_name) {
+
                     if (mtl_data.new_mtl_unmap.find(mtl_name) != mtl_data.new_mtl_unmap.end()) {
                         bool is_merge_ka_kd = true;
                         for (size_t n = 0; n < 3; n++) {
@@ -161,13 +179,6 @@ bool load_obj(const char *path, TriangleMesh *meshptr, ObjInfo& obj_info, std::s
                             if (obj_info.pngs.find(png_name) == obj_info.pngs.end()) { obj_info.pngs[png_name] = false; }
                             obj_info.uv_map_pngs[face_index] = png_name;
                         }
-                        if (data.textureCoordinates.size() > 0) {
-                            Vec2f                uv0(data.textureCoordinates[uvs[0] * 2], data.textureCoordinates[uvs[0] * 2 + 1]);
-                            Vec2f                uv1(data.textureCoordinates[uvs[1] * 2], data.textureCoordinates[uvs[1] * 2 + 1]);
-                            Vec2f                uv2(data.textureCoordinates[uvs[2] * 2], data.textureCoordinates[uvs[2] * 2 + 1]);
-                            std::array<Vec2f, 3> uv_array{uv0, uv1, uv2};
-                            obj_info.uvs.emplace_back(uv_array);
-                        }
                         obj_info.face_colors.emplace_back(face_color);
                     }
                     else {
@@ -189,12 +200,14 @@ bool load_obj(const char *path, TriangleMesh *meshptr, ObjInfo& obj_info, std::s
                         }
                     }
                 };
+                add_face_uv({0, 1, 2});
                 if (exist_mtl) {
                     set_face_color_by_mtl(face_index);
                 }
                 if (cnt == 4) {
                     its.indices.emplace_back(indices[0], indices[2], indices[3]);
                     int face_index = its.indices.size() - 1;
+                    add_face_uv({0, 2, 3});
                     if (exist_mtl) {
                         set_face_color_by_mtl(face_index);
                     }
@@ -208,8 +221,11 @@ bool load_obj(const char *path, TriangleMesh *meshptr, ObjInfo& obj_info, std::s
         message = _L("This OBJ file couldn't be read because it's empty.");
         return false;
     }
-    if (meshptr->volume() < 0)
+    if (meshptr->volume() < 0) {
         meshptr->flip_triangles();
+        for (std::array<Vec2f, 3> &face_uvs : obj_info.uvs)
+            std::swap(face_uvs[1], face_uvs[2]);
+    }
     return true;
 }
 
@@ -226,7 +242,17 @@ bool load_obj(const char *path, Model *model, ObjInfo& obj_info, std::string &me
             object_name.assign((last_slash == nullptr) ? path : last_slash + 1);
         } else
            object_name.assign(object_name_in);
-        model->add_object(object_name.c_str(), path, std::move(mesh));
+        ModelObject *object = model->add_object(object_name.c_str(), path, std::move(mesh));
+        auto full_color_data = FullColor::build_surface_data_from_obj_info(path, obj_info);
+        if (object != nullptr && !object->volumes.empty() && full_color_data && !full_color_data->empty()) {
+            BOOST_LOG_TRIVIAL(warning) << "load_obj: attached full-color data: vertex_colors=" << full_color_data->vertex_colors.size()
+                                       << ", triangles=" << full_color_data->triangles.size()
+                                       << ", textures=" << full_color_data->textures.size()
+                                       << ", has_uv_png=" << obj_info.has_uv_png;
+            object->volumes.front()->full_color_data = std::move(full_color_data);
+        } else {
+            BOOST_LOG_TRIVIAL(info) << "load_obj: no full-color data attached, has_uv_png=" << obj_info.has_uv_png;
+        }
     }
 
     return ret;

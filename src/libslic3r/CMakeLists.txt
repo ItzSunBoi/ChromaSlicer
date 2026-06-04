@@ -191,6 +191,10 @@ set(lisbslic3r_sources
     format.hpp
     Format/OBJ.cpp
     Format/OBJ.hpp
+    FullColor/FullColorSurfaceData.cpp
+    FullColor/FullColorSurfaceData.hpp
+    FullColor/ObjColorConvert.cpp
+    FullColor/ObjColorConvert.hpp
     Format/objparser.cpp
     Format/objparser.hpp
     Format/SL1.cpp
