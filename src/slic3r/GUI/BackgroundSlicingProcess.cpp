@@ -1,10 +1,13 @@
 #include "BackgroundSlicingProcess.hpp"
+#include "libslic3r/FullColor/FullColorRasterPipeline.hpp"
+
 #include "GUI_App.hpp"
 #include "GUI.hpp"
 #include "MainFrame.hpp"
 #include "format.hpp"
 
 #include <wx/app.h>
+#include <fstream>
 #include <wx/panel.h>
 #include <wx/stdpaths.h>
 
@@ -17,6 +20,7 @@
 
 // Print now includes tbb, and tbb includes Windows. This breaks compilation of wxWidgets if included before wx.
 #include "libslic3r/Print.hpp"
+#include "libslic3r/FullColor/FullColorRasterPipeline.hpp"
 #include "libslic3r/SLAPrint.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/GCode/PostProcessor.hpp"
@@ -36,6 +40,77 @@
 //#include "RemovableDriveManager.hpp"
 
 #include "slic3r/GUI/Plater.hpp"
+
+static void generate_full_color_chroma_for_final_export(
+    const Slic3r::Print* fff_print,
+    const std::string& final_gcode_path
+)
+{
+    try {
+        if (fff_print == nullptr) {
+            BOOST_LOG_TRIVIAL(error) << "FullColor Final Export: skipped, fff_print is null";
+            return;
+        }
+
+        if (final_gcode_path.empty()) {
+            BOOST_LOG_TRIVIAL(error) << "FullColor Final Export: skipped, final_gcode_path is empty";
+            return;
+        }
+
+        const boost::filesystem::path final_path(final_gcode_path);
+
+        BOOST_LOG_TRIVIAL(error)
+            << "FullColor Final Export: generating Chroma package for final path="
+            << final_gcode_path;
+
+        const Slic3r::FullColor::RasterPipelineOutput chroma_output =
+            Slic3r::FullColor::generate_full_color_rasters(*fff_print, final_gcode_path);
+
+        BOOST_LOG_TRIVIAL(error)
+            << "FullColor Final Export: generated="
+            << (chroma_output.generated ? "true" : "false")
+            << ", output="
+            << chroma_output.output_dir;
+
+        // In full-colour mode the user-facing deliverable is the .chroma package,
+        // not a loose .gcode plus sidecar files. Keep the .gcode only if Chroma
+        // generation failed, so the user is not left with no export at all.
+        if (chroma_output.generated) {
+            boost::system::error_code ec;
+
+            if (boost::filesystem::exists(final_path, ec)) {
+                boost::filesystem::remove(final_path, ec);
+                if (ec) {
+                    BOOST_LOG_TRIVIAL(error)
+                        << "FullColor Final Export: failed to remove loose G-code '"
+                        << final_path.string() << "': " << ec.message();
+                } else {
+                    BOOST_LOG_TRIVIAL(info)
+                        << "FullColor Final Export: removed loose G-code after packaging: "
+                        << final_path.string();
+                }
+            }
+
+            // Remove old temporary debug marker if a previous debug build created it.
+            boost::filesystem::path old_marker(final_path);
+            old_marker += ".fullcolor_final_export_hook.txt";
+            if (boost::filesystem::exists(old_marker, ec)) {
+                boost::filesystem::remove(old_marker, ec);
+                if (ec) {
+                    BOOST_LOG_TRIVIAL(error)
+                        << "FullColor Final Export: failed to remove debug marker '"
+                        << old_marker.string() << "': " << ec.message();
+                }
+            }
+        }
+    } catch (const std::exception& e) {
+        BOOST_LOG_TRIVIAL(error)
+            << "FullColor Final Export: exception: "
+            << e.what();
+    } catch (...) {
+        BOOST_LOG_TRIVIAL(error) << "FullColor Final Export: unknown exception";
+    }
+}
 
 namespace Slic3r {
 
@@ -818,6 +893,9 @@ void BackgroundSlicingProcess::finalize_gcode()
 	try
 	{
 		copy_ret_val = copy_file(output_path, export_path, error_message, m_export_path_on_removable_media);
+
+		if (copy_ret_val == SUCCESS)
+			generate_full_color_chroma_for_final_export(m_fff_print, export_path);
 		remove_post_processed_temp_file();
 	}
 	catch (...)
@@ -866,6 +944,9 @@ void BackgroundSlicingProcess::export_gcode()
 	try
 	{
 		copy_ret_val = copy_file(output_path, export_path, error_message, m_export_path_on_removable_media);
+		if (copy_ret_val == SUCCESS)
+			generate_full_color_chroma_for_final_export(m_fff_print, export_path);
+			
 	}
 	catch (...)
 	{

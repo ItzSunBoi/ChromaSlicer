@@ -2613,35 +2613,43 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
 // The export_gcode may die for various reasons (fails to process filename_format,
 // write error into the G-code, cannot execute post-processing scripts).
 // It is up to the caller to show an error message.
-std::string Print::export_gcode(const std::string& path_template, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb)
+std::string Print::export_gcode(
+    const std::string& path_template,
+    GCodeProcessorResult* result,
+    ThumbnailsGeneratorCallback thumbnail_cb
+)
 {
     // output everything to a G-code file
     // The following call may die if the filename_format template substitution fails.
     std::string path = this->output_filepath(path_template);
+
     std::string message;
     if (!path.empty() && result == nullptr) {
         // Only show the path if preview_data is not set -> running from command line.
         message = L("Exporting G-code");
         message += " to ";
         message += path;
-    } else
+    } else {
         message = L("Generating G-code");
+    }
+
     this->set_status(80, message);
 
-    // The following line may die for multiple reasons.
-    FullColor::generate_full_color_rasters(*this, path);
-
     GCode gcode;
-    //BBS: compute plate offset for gcode-generator
+
+    // BBS: compute plate offset for gcode-generator
     const Vec3d origin = this->get_plate_origin();
     gcode.set_gcode_offset(origin(0), origin(1));
+
     gcode.do_export(this, path.c_str(), result, thumbnail_cb);
     gcode.export_layer_filaments(result);
-    //BBS
-    result->conflict_result = m_conflict_result;
-    return path.c_str();
-}
 
+    // BBS
+    if (result != nullptr)
+        result->conflict_result = m_conflict_result;
+
+    return path;
+}
 void Print::_make_skirt()
 {
     // First off we need to decide how tall the skirt must be.
