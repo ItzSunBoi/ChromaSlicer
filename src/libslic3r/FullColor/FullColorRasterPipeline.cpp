@@ -21,6 +21,7 @@
 #include <limits>
 #include <memory>
 #include <sstream>
+#include <unordered_map>
 
 namespace Slic3r::FullColor {
 
@@ -52,6 +53,39 @@ struct LayerRasterInfo
     double z0 = 0.;
     double z1 = 0.;
     double sample_z = 0.;
+};
+
+struct GridKey
+{
+    int x = 0;
+    int y = 0;
+    int z = 0;
+
+    bool operator==(const GridKey &other) const
+    {
+        return x == other.x && y == other.y && z == other.z;
+    }
+};
+
+struct GridKeyHash
+{
+    size_t operator()(const GridKey &key) const
+    {
+        size_t seed = 0;
+        auto combine = [&seed](int value) {
+            seed ^= std::hash<int>{}(value) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        };
+        combine(key.x);
+        combine(key.y);
+        combine(key.z);
+        return seed;
+    }
+};
+
+struct SurfaceSampleGrid
+{
+    double cell_size = 1.0;
+    std::unordered_map<GridKey, std::vector<const SurfaceSample*>, GridKeyHash> cells;
 };
 
 static std::uint8_t to_u8(float value)
@@ -184,6 +218,74 @@ static std::vector<LayerRasterInfo> collect_layers(const Print &print)
     for (size_t idx = 0; idx < layers.size(); ++idx)
         layers[idx].index = idx;
     return layers;
+}
+
+static GridKey grid_key(const Vec3d &pos, double cell_size)
+{
+    return {
+        static_cast<int>(std::floor(pos.x() / cell_size)),
+        static_cast<int>(std::floor(pos.y() / cell_size)),
+        static_cast<int>(std::floor(pos.z() / cell_size))
+    };
+}
+
+static SurfaceSampleGrid build_surface_sample_grid(const std::vector<SurfaceSample> &samples, double shell_thickness)
+{
+    SurfaceSampleGrid grid;
+    grid.cell_size = std::max(FULL_COLOR_PIXEL_SIZE_MM * 4.0, shell_thickness);
+    grid.cells.reserve(samples.size());
+    for (const SurfaceSample &sample : samples)
+        grid.cells[grid_key(sample.pos, grid.cell_size)].push_back(&sample);
+    return grid;
+}
+
+static const SurfaceSample *find_best_sample(
+    const SurfaceSampleGrid &grid,
+    const Vec3d &query,
+    double shell_thickness)
+{
+    const GridKey center = grid_key(query, grid.cell_size);
+    const int search_radius = std::max(1, static_cast<int>(std::ceil(shell_thickness / grid.cell_size)) + 1);
+    const double shell_sq = shell_thickness * shell_thickness;
+
+    const SurfaceSample *best = nullptr;
+    double best_dist_sq = shell_sq;
+    for (int dz = -search_radius; dz <= search_radius; ++dz) {
+        for (int dy = -search_radius; dy <= search_radius; ++dy) {
+            for (int dx = -search_radius; dx <= search_radius; ++dx) {
+                const auto cell_it = grid.cells.find({center.x + dx, center.y + dy, center.z + dz});
+                if (cell_it == grid.cells.end())
+                    continue;
+
+                for (const SurfaceSample *sample : cell_it->second) {
+                    const Vec3d delta = query - sample->pos;
+                    const double normal_distance = delta.dot(sample->normal);
+                    if (normal_distance > FULL_COLOR_NORMAL_TOLERANCE_MM)
+                        continue;
+
+                    const double dist_sq = delta.squaredNorm();
+                    if (dist_sq <= best_dist_sq) {
+                        best_dist_sq = dist_sq;
+                        best = sample;
+                    }
+                }
+            }
+        }
+    }
+
+    return best;
+}
+
+static boost::filesystem::path full_color_output_dir(const std::string &gcode_path)
+{
+    const boost::filesystem::path gcode(gcode_path);
+    if (!gcode_path.empty() && !gcode.stem().empty())
+        return gcode.parent_path() / (gcode.stem().string() + "_full_color");
+
+    const boost::filesystem::path fallback =
+        boost::filesystem::temp_directory_path() / boost::filesystem::unique_path("orcaslicer_full_color_%%%%-%%%%-%%%%");
+    BOOST_LOG_TRIVIAL(warning) << "FullColor Raster: no G-code output path available, using debug output=" << fallback.string();
+    return fallback;
 }
 
 static void write_json_file(const boost::filesystem::path &path, const json &data)
@@ -337,8 +439,12 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
         return output;
     }
 
-    const boost::filesystem::path gcode(gcode_path);
-    const boost::filesystem::path output_dir = gcode.parent_path() / (gcode.stem().string() + "_full_color");
+    const SurfaceSampleGrid sample_grid = build_surface_sample_grid(samples, shell_thickness);
+    BOOST_LOG_TRIVIAL(info) << "FullColor Raster: sample_count=" << samples.size()
+                            << ", grid_cells=" << sample_grid.cells.size()
+                            << ", grid_cell_size=" << sample_grid.cell_size << " mm";
+
+    const boost::filesystem::path output_dir = full_color_output_dir(gcode_path);
     const boost::filesystem::path layer_dir = output_dir / "layers";
     boost::filesystem::create_directories(layer_dir);
 
@@ -361,16 +467,19 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
         {"max", {max_pt.x(), max_pt.y(), max_pt.z()}},
         {"image_width", width},
         {"image_height", height},
-        {"origin_xy_mm", {min_pt.x(), min_pt.y()}}
+        {"origin_xy_mm", {min_pt.x(), min_pt.y()}},
+        {"coordinate_origin", "min model bounds in print-bed XY, units mm"},
+        {"image_row_0_y_mm", min_pt.y()},
+        {"image_y_flipped", false},
+        {"background", "white"}
     };
     manifest["full_color_volumes"] = output.summary.textured_volume_count;
     manifest["textures"] = output.summary.total_textures;
     manifest["loaded_textures"] = loaded_texture_count;
     manifest["layers"] = json::array();
 
-    const double shell_sq = shell_thickness * shell_thickness;
     for (const LayerRasterInfo &layer : layers) {
-        std::vector<std::uint8_t> image(static_cast<size_t>(width) * static_cast<size_t>(height) * 3, 0);
+        std::vector<std::uint8_t> image(static_cast<size_t>(width) * static_cast<size_t>(height) * 3, 255);
         for (int y = 0; y < height; ++y) {
             const double py = min_pt.y() + (y + 0.5) * FULL_COLOR_PIXEL_SIZE_MM;
             for (int x = 0; x < width; ++x) {
@@ -379,20 +488,7 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
                     py,
                     layer.sample_z);
 
-                const SurfaceSample *best = nullptr;
-                double best_dist_sq = shell_sq;
-                for (const SurfaceSample &sample : samples) {
-                    const Vec3d delta = query - sample.pos;
-                    const double normal_distance = delta.dot(sample.normal);
-                    if (normal_distance > FULL_COLOR_NORMAL_TOLERANCE_MM)
-                        continue;
-
-                    const double dist_sq = delta.squaredNorm();
-                    if (dist_sq <= best_dist_sq) {
-                        best_dist_sq = dist_sq;
-                        best = &sample;
-                    }
-                }
+                const SurfaceSample *best = find_best_sample(sample_grid, query, shell_thickness);
 
                 if (best != nullptr) {
                     const size_t idx = (static_cast<size_t>(y) * width + x) * 3;
@@ -406,6 +502,7 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
         const std::string base = layer_basename(layer.index);
         const boost::filesystem::path png_path = layer_dir / (base + ".png");
         const boost::filesystem::path json_path = layer_dir / (base + ".json");
+        BOOST_LOG_TRIVIAL(info) << "FullColor Raster: writing " << png_path.filename().string();
         png::write_rgb_to_file(png_path.string(), width, height, image);
 
         json layer_json;
@@ -418,6 +515,10 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
         layer_json["image_width"] = width;
         layer_json["image_height"] = height;
         layer_json["origin_xy_mm"] = {min_pt.x(), min_pt.y()};
+        layer_json["image_row_0_y_mm"] = min_pt.y();
+        layer_json["image_y_flipped"] = false;
+        layer_json["background"] = "white";
+        layer_json["units"] = "mm";
         layer_json["coordinate_convention"] = "print-bed XY in mm; sample_z uses actual PrintObject layer slice_z";
         layer_json["image"] = png_path.filename().string();
         write_json_file(json_path, layer_json);

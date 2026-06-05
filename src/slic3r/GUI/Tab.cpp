@@ -2871,6 +2871,24 @@ void TabPrint::toggle_options()
         }
         cb->SetValue(n);
     }
+
+    const DynamicPrintConfig &printer_cfg = m_preset_bundle->printers.get_edited_preset().config;
+    const bool enable_full_color_printing = printer_cfg.has("enable_full_color_printing") &&
+        printer_cfg.opt_bool("enable_full_color_printing");
+    const wxString full_color_override_tooltip =
+        _L("Disabled because full-color printing is enabled. The effective value is calculated from Color shell thickness.");
+
+    for (const char *opt_key : {"wall_loops", "top_shell_layers", "bottom_shell_layers", "top_shell_thickness", "bottom_shell_thickness"}) {
+        Field *shell_field = m_active_page->get_field(opt_key);
+        if (shell_field == nullptr)
+            continue;
+
+        shell_field->toggle(!enable_full_color_printing);
+        if (wxWindow *window = shell_field->getWindow())
+            window->SetToolTip(enable_full_color_printing ?
+                full_color_override_tooltip :
+                shell_field->get_tooltip_text(wxEmptyString));
+    }
 }
 
 void TabPrint::update()
