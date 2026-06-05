@@ -53,6 +53,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -1438,7 +1439,7 @@ struct GCodeViewer::FullColorLayerOverlay
         const double y0 = layer.origin_xy.y();
         const double x1 = x0 + static_cast<double>(width) * layer.pixel_size_mm;
         const double y1 = y0 + static_cast<double>(height) * layer.pixel_size_mm;
-        const float z = static_cast<float>(layer.sample_z + FULL_COLOR_OVERLAY_Z_OFFSET_MM);
+        const float z = static_cast<float>(layer.z1 + FULL_COLOR_OVERLAY_Z_OFFSET_MM);
         const float v_bottom = layer.image_y_flipped ? 1.0f : 0.0f;
         const float v_top = layer.image_y_flipped ? 0.0f : 1.0f;
 
@@ -1492,6 +1493,21 @@ struct GCodeViewer::FullColorLayerOverlay
         shader->set_uniform("projection_matrix", camera.get_projection_matrix());
         texture->quad.render(shader);
         shader->stop_using();
+    }
+
+    void render_range(size_t first_layer_index, size_t last_layer_index)
+    {
+        if (!package_available)
+            return;
+
+        if (last_layer_index < first_layer_index)
+            std::swap(first_layer_index, last_layer_index);
+
+        for (size_t layer_index = first_layer_index; layer_index <= last_layer_index; ++layer_index) {
+            render(layer_index);
+            if (layer_index == std::numeric_limits<size_t>::max())
+                break;
+        }
     }
 };
 
@@ -2993,8 +3009,11 @@ void GCodeViewer::render_full_color_layer_overlay()
     if (!m_show_full_color_layers || !m_full_color_layer_overlay || !m_full_color_layer_overlay->package_available || m_layers_slider == nullptr)
         return;
 
-    const int layer_idx = std::max(0, m_layers_slider->GetHigherValue());
-    m_full_color_layer_overlay->render(static_cast<size_t>(layer_idx));
+    const int lower_layer_idx = std::max(0, m_layers_slider->GetLowerValue());
+    const int higher_layer_idx = std::max(0, m_layers_slider->GetHigherValue());
+    m_full_color_layer_overlay->render_range(
+        static_cast<size_t>(std::min(lower_layer_idx, higher_layer_idx)),
+        static_cast<size_t>(std::max(lower_layer_idx, higher_layer_idx)));
 }
 
 void GCodeViewer::render_shells(int canvas_width, int canvas_height)
