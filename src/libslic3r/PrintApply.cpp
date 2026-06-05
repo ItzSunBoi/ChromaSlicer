@@ -3,9 +3,97 @@
 #include "Print.hpp"
 
 #include <boost/log/trivial.hpp>
+#include <algorithm>
 #include <cfloat>
+#include <cmath>
 
 namespace Slic3r {
+
+static double full_color_first_nozzle_diameter(const DynamicPrintConfig &config)
+{
+    const ConfigOptionFloats *nozzle_diameter = config.option<ConfigOptionFloats>("nozzle_diameter");
+    if (nozzle_diameter != nullptr && !nozzle_diameter->values.empty() && nozzle_diameter->values.front() > 0.)
+        return nozzle_diameter->values.front();
+    return 0.4;
+}
+
+static double full_color_abs_float_or_percent(const DynamicPrintConfig &config, const char *key, const double ratio_over, const double fallback)
+{
+    const ConfigOption *raw_option = config.option(key);
+    if (raw_option == nullptr)
+        return fallback;
+
+    switch (raw_option->type()) {
+    case coFloat:
+        return static_cast<const ConfigOptionFloat*>(raw_option)->value;
+    case coInt:
+        return static_cast<const ConfigOptionInt*>(raw_option)->value;
+    case coPercent:
+        return static_cast<const ConfigOptionPercent*>(raw_option)->get_abs_value(ratio_over);
+    case coFloatOrPercent: {
+        const ConfigOptionFloatOrPercent *option = static_cast<const ConfigOptionFloatOrPercent*>(raw_option);
+        if (option->value == 0.)
+            return fallback;
+        return option->get_abs_value(ratio_over);
+    }
+    default:
+        return fallback;
+    }
+}
+
+static void apply_full_color_shell_requirements(DynamicPrintConfig &config)
+{
+    const bool enabled = config.has("enable_full_color_printing") && config.opt_bool("enable_full_color_printing");
+    if (!enabled)
+        return;
+
+    const double shell_thickness = config.has("full_color_shell_thickness") ?
+        std::max(0.01, config.opt_float("full_color_shell_thickness")) : 1.20;
+    BOOST_LOG_TRIVIAL(info) << "FullColor: full_color_shell_thickness=" << shell_thickness << " mm";
+
+    const double nozzle_diameter = full_color_first_nozzle_diameter(config);
+    const double line_width = full_color_abs_float_or_percent(config, "line_width", nozzle_diameter, nozzle_diameter);
+    const double outer_wall_line_width = full_color_abs_float_or_percent(config, "outer_wall_line_width", nozzle_diameter, line_width);
+    double wall_line_width = full_color_abs_float_or_percent(config, "inner_wall_line_width", nozzle_diameter, outer_wall_line_width);
+    if (wall_line_width <= 0.)
+        wall_line_width = outer_wall_line_width > 0. ? outer_wall_line_width : line_width;
+    if (wall_line_width <= 0.)
+        wall_line_width = nozzle_diameter;
+
+    double layer_height = config.has("layer_height") ? config.opt_float("layer_height") : 0.;
+    if (layer_height <= 0.)
+        layer_height = 0.2;
+
+    BOOST_LOG_TRIVIAL(info) << "FullColor: effective shell requirements use wall_line_width="
+                            << wall_line_width << " mm, layer_height=" << layer_height << " mm";
+
+    const int required_wall_count = std::max(1, static_cast<int>(std::ceil(shell_thickness / wall_line_width)));
+    const int required_shell_layers = std::max(1, static_cast<int>(std::ceil(shell_thickness / layer_height)));
+
+    ConfigOptionInt *wall_loops = config.option<ConfigOptionInt>("wall_loops", true);
+    if (wall_loops->value < required_wall_count) {
+        BOOST_LOG_TRIVIAL(info) << "FullColor: increasing wall count from " << wall_loops->value
+                                << " to " << required_wall_count << " to satisfy "
+                                << shell_thickness << " mm color shell thickness";
+        wall_loops->value = required_wall_count;
+    }
+
+    ConfigOptionInt *top_layers = config.option<ConfigOptionInt>("top_shell_layers", true);
+    if (top_layers->value < required_shell_layers) {
+        BOOST_LOG_TRIVIAL(info) << "FullColor: increasing top layers from " << top_layers->value
+                                << " to " << required_shell_layers << " to satisfy "
+                                << shell_thickness << " mm color shell thickness";
+        top_layers->value = required_shell_layers;
+    }
+
+    ConfigOptionInt *bottom_layers = config.option<ConfigOptionInt>("bottom_shell_layers", true);
+    if (bottom_layers->value < required_shell_layers) {
+        BOOST_LOG_TRIVIAL(info) << "FullColor: increasing bottom layers from " << bottom_layers->value
+                                << " to " << required_shell_layers << " to satisfy "
+                                << shell_thickness << " mm color shell thickness";
+        bottom_layers->value = required_shell_layers;
+    }
+}
 
 // Add or remove support modifier ModelVolumes from model_object_dst to match the ModelVolumes of model_object_new
 // in the exact order and with the same IDs.
@@ -1131,6 +1219,9 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", i=%1%, key=%2%")%i %changed_keys[i];
         }
     }
+
+    apply_full_color_shell_requirements(new_full_config);
+
     const ConfigOption* enable_support_option = new_full_config.option("enable_support");
     if (enable_support_option && enable_support_option->getBool())
         m_support_used = true;

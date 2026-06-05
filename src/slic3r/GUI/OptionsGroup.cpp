@@ -948,6 +948,8 @@ boost::any ConfigOptionsGroup::get_config_value(const DynamicPrintConfig& config
 
     if (!config.has(opt_key) && opt_key == "enable_full_color_printing")
         return false;
+    if (!config.has(opt_key) && opt_key == "full_color_shell_thickness")
+        return "1.2";
 
     if (opt->nullable)
     {

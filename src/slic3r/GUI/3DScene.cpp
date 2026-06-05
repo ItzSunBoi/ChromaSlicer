@@ -90,6 +90,67 @@ namespace Slic3r {
 
 static constexpr int FULL_COLOR_PREVIEW_UV_BINS = 16;
 
+static thread_local FullColorRenderContext s_full_color_render_context = FullColorRenderContext::Unknown;
+
+static const char *full_color_render_context_name(FullColorRenderContext context)
+{
+    switch (context) {
+    case FullColorRenderContext::PrepareViewport:     return "PrepareViewport";
+    case FullColorRenderContext::GCodePreview:        return "GCodePreview";
+    case FullColorRenderContext::MiniPlatePreview:    return "MiniPlatePreview";
+    case FullColorRenderContext::Thumbnail:           return "Thumbnail";
+    case FullColorRenderContext::SlicedReportPreview: return "SlicedReportPreview";
+    case FullColorRenderContext::Unknown:
+    default:                                          return "Unknown";
+    }
+}
+
+static bool full_color_preview_allowed_for_context(FullColorRenderContext context, bool printer_setting_enabled, bool debug_override_enabled)
+{
+    switch (context) {
+    case FullColorRenderContext::PrepareViewport:
+        return printer_setting_enabled || debug_override_enabled;
+    case FullColorRenderContext::GCodePreview:
+    case FullColorRenderContext::MiniPlatePreview:
+    case FullColorRenderContext::Thumbnail:
+    case FullColorRenderContext::SlicedReportPreview:
+    case FullColorRenderContext::Unknown:
+    default:
+        return false;
+    }
+}
+
+FullColorRenderContextScope::FullColorRenderContextScope(FullColorRenderContext context)
+    : m_previous(s_full_color_render_context)
+{
+    s_full_color_render_context = context;
+}
+
+FullColorRenderContextScope::~FullColorRenderContextScope()
+{
+    s_full_color_render_context = m_previous;
+}
+
+struct GLFullColorStateGuard
+{
+    GLint active_texture = GL_TEXTURE0;
+    GLint texture_2d_binding = 0;
+
+    GLFullColorStateGuard()
+    {
+        glsafe(::glGetIntegerv(GL_ACTIVE_TEXTURE, &active_texture));
+        glsafe(::glActiveTexture(GL_TEXTURE0));
+        glsafe(::glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture_2d_binding));
+    }
+
+    ~GLFullColorStateGuard()
+    {
+        glsafe(::glActiveTexture(GL_TEXTURE0));
+        glsafe(::glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(texture_2d_binding)));
+        glsafe(::glActiveTexture(static_cast<GLenum>(active_texture)));
+    }
+};
+
 static bool full_color_preview_allowed()
 {
     const bool debug_override = ::getenv("ORCA_FULL_COLOR_PREVIEW") != nullptr;
@@ -98,10 +159,12 @@ static bool full_color_preview_allowed()
 
     const DynamicPrintConfig &config = GUI::wxGetApp().preset_bundle->full_config();
     const bool enabled = config.has("enable_full_color_printing") && config.opt_bool("enable_full_color_printing");
-    BOOST_LOG_TRIVIAL(info) << "FullColor: enable_full_color_printing=" << (enabled ? "true" : "false")
-                            << (debug_override ? ", debug viewport override enabled" :
-                                (enabled ? ", full-color viewport preview allowed" : ", using normal viewport path"));
-    return enabled || debug_override;
+    const bool allowed = full_color_preview_allowed_for_context(s_full_color_render_context, enabled, debug_override);
+    BOOST_LOG_TRIVIAL(debug) << "FullColor Preview: " << (allowed ? "enabled" : "disabled")
+                             << " for context=" << full_color_render_context_name(s_full_color_render_context)
+                             << ", enable_full_color_printing=" << (enabled ? "true" : "false")
+                             << ", debug_override=" << (debug_override ? "true" : "false");
+    return allowed;
 }
 
 static ColorRGBA full_color_preview_color(const RGBA &color)
@@ -796,6 +859,7 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
         (!full_color_texture_preview_models.empty() || !full_color_preview_models.empty()) && full_color_preview_allowed();
     if (render_full_color_preview) {
         if (shader != nullptr && !full_color_texture_preview_models.empty()) {
+            GLFullColorStateGuard state_guard;
             shader->set_uniform("uniform_texture", 0);
             shader->set_uniform("use_texture", true);
             glsafe(::glActiveTexture(GL_TEXTURE0));

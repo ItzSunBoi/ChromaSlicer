@@ -2248,6 +2248,7 @@ void GLCanvas3D::render_thumbnail(ThumbnailData &           thumbnail_data,
                                   bool                      for_picking,
                                   bool                      ban_light)
 {
+    FullColorRenderContextScope full_color_context_scope(FullColorRenderContext::Thumbnail);
     GLShaderProgram* shader = nullptr;
     if (for_picking)
         shader = wxGetApp().get_shader("flat");
@@ -2286,6 +2287,7 @@ void GLCanvas3D::render_thumbnail(ThumbnailData &                    thumbnail_d
                                   bool                               for_picking,
                                   bool                               ban_light)
 {
+    FullColorRenderContextScope full_color_context_scope(FullColorRenderContext::Thumbnail);
     GLShaderProgram *shader = wxGetApp().get_shader("thumbnail");
     switch (OpenGLManager::get_framebuffers_type()) {
         case OpenGLManager::EFramebufferType::Arb: {
@@ -8141,6 +8143,11 @@ void GLCanvas3D::_render_objects(GLVolumeCollection::ERenderType type, bool with
     if (shader == nullptr && shader_name != "gouraud")
         shader = wxGetApp().get_shader("gouraud");
     ECanvasType canvas_type = this->m_canvas_type;
+    const FullColorRenderContext full_color_context =
+        canvas_type == ECanvasType::CanvasView3D ? FullColorRenderContext::PrepareViewport :
+        canvas_type == ECanvasType::CanvasPreview ? FullColorRenderContext::GCodePreview :
+        FullColorRenderContext::Unknown;
+    FullColorRenderContextScope full_color_context_scope(full_color_context);
     bool                 partly_inside_enable = canvas_type == ECanvasType::CanvasAssembleView ? false : true;
     if (shader != nullptr) {
         shader->start_using();

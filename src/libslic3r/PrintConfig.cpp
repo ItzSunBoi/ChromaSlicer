@@ -706,6 +706,14 @@ void PrintConfigDef::init_common_params()
     def->mode     = comAdvanced;
     def->set_default_value(new ConfigOptionBool{false});
 
+    def           = this->add("full_color_shell_thickness", coFloat);
+    def->label    = L("Color shell thickness");
+    def->tooltip  = L("Minimum inward shell depth used for full-color raster generation. Wall count and top/bottom shell thickness must be at least this thick when full-color printing is enabled.");
+    def->sidetext = "mm";
+    def->mode     = comAdvanced;
+    def->min      = 0.01;
+    def->set_default_value(new ConfigOptionFloat{1.20});
+
     def           = this->add("parallel_printheads_count", coInt);
     def->label    = L("Parallel printheads count");
     def->tooltip  = L("Set the number of parallel printheads for machines like OrangeStorm Giga printer.");

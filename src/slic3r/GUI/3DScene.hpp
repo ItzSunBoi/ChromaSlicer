@@ -61,6 +61,26 @@ enum ModelInstanceEPrintVolumeState : unsigned char;
 
 using ModelObjectPtrs = std::vector<ModelObject*>;
 
+enum class FullColorRenderContext
+{
+    PrepareViewport,
+    GCodePreview,
+    MiniPlatePreview,
+    Thumbnail,
+    SlicedReportPreview,
+    Unknown
+};
+
+class FullColorRenderContextScope
+{
+public:
+    explicit FullColorRenderContextScope(FullColorRenderContext context);
+    ~FullColorRenderContextScope();
+
+private:
+    FullColorRenderContext m_previous;
+};
+
 struct ObjectFilamentInfo {
     ModelObject* object;
     std::map<int, int> manual_filaments; //manual mode: filament id -> extruder id can not be printed

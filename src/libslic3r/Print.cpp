@@ -2184,8 +2184,6 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
     if (m_objects.empty())
         return;
 
-    FullColor::collect_full_color_raster_summary(this->model(), m_config);
-
     for (PrintObject *obj : m_objects)
         obj->clear_shared_object();
 
@@ -2631,6 +2629,8 @@ std::string Print::export_gcode(const std::string& path_template, GCodeProcessor
     this->set_status(80, message);
 
     // The following line may die for multiple reasons.
+    FullColor::generate_full_color_rasters(*this, path);
+
     GCode gcode;
     //BBS: compute plate offset for gcode-generator
     const Vec3d origin = this->get_plate_origin();
