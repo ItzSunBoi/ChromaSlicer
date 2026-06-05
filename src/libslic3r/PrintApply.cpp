@@ -49,7 +49,8 @@ static void apply_full_color_shell_requirements(DynamicPrintConfig &config)
 
     const double shell_thickness = config.has("full_color_shell_thickness") ?
         std::max(0.01, config.opt_float("full_color_shell_thickness")) : 1.20;
-    BOOST_LOG_TRIVIAL(info) << "FullColor: full_color_shell_thickness=" << shell_thickness << " mm";
+    BOOST_LOG_TRIVIAL(info) << "FullColor: enable_full_color_printing=true, full_color_shell_thickness="
+                            << shell_thickness << " mm";
 
     const double nozzle_diameter = full_color_first_nozzle_diameter(config);
     const double line_width = full_color_abs_float_or_percent(config, "line_width", nozzle_diameter, nozzle_diameter);

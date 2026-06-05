@@ -4520,6 +4520,9 @@ void TabPrinter::build_fff()
                     }
                 }
 
+                if (opt_key == "enable_full_color_printing")
+                    toggle_options();
+
                 update_dirty();
                 on_value_change(opt_key, value);
             });
@@ -5457,6 +5460,10 @@ void TabPrinter::toggle_options()
 
         const bool support_parallel_printheads = printer_cfg.opt_bool("support_parallel_printheads");
         toggle_line("parallel_printheads_count", support_parallel_printheads);
+
+        const bool enable_full_color_printing = printer_cfg.has("enable_full_color_printing") &&
+            printer_cfg.opt_bool("enable_full_color_printing");
+        toggle_option("full_color_shell_thickness", enable_full_color_printing);
     }
     
 
