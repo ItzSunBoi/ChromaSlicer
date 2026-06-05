@@ -17,6 +17,7 @@
 #include <array>
 #include <cstdint>
 #include <float.h>
+#include <memory>
 #include <set>
 #include <unordered_set>
 
@@ -245,6 +246,10 @@ mutable bool m_no_render_path { false };
     libvgcode::Viewer m_viewer;
     bool m_loaded_as_preview{ false };
 
+    struct FullColorLayerOverlay;
+    std::unique_ptr<FullColorLayerOverlay> m_full_color_layer_overlay;
+    bool m_show_full_color_layers{ false };
+
 public:
     GCodeViewer();
     ~GCodeViewer();
@@ -357,6 +362,7 @@ private:
     //void load_shells(const Print& print);
     void render_toolpaths();
     void render_shells(int canvas_width, int canvas_height);
+    void render_full_color_layer_overlay();
 
     //BBS: GUI refactor: add canvas size
     void render_legend(float &legend_height, int canvas_width, int canvas_height, int right_margin);
@@ -368,4 +374,3 @@ private:
 } // namespace Slic3r
 
 #endif // slic3r_GCodeViewer_hpp_
-

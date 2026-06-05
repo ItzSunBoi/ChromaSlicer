@@ -20,7 +20,6 @@
 
 // Print now includes tbb, and tbb includes Windows. This breaks compilation of wxWidgets if included before wx.
 #include "libslic3r/Print.hpp"
-#include "libslic3r/FullColor/FullColorRasterPipeline.hpp"
 #include "libslic3r/SLAPrint.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/GCode/PostProcessor.hpp"
@@ -41,74 +40,102 @@
 
 #include "slic3r/GUI/Plater.hpp"
 
-static void generate_full_color_chroma_for_final_export(
+static void generate_full_color_chroma_for_slice_preview(
     const Slic3r::Print* fff_print,
-    const std::string& final_gcode_path
+    const std::string& preview_gcode_path
 )
 {
     try {
         if (fff_print == nullptr) {
-            BOOST_LOG_TRIVIAL(error) << "FullColor Final Export: skipped, fff_print is null";
+            BOOST_LOG_TRIVIAL(error) << "FullColor Slice Preview: skipped, fff_print is null";
             return;
         }
 
-        if (final_gcode_path.empty()) {
-            BOOST_LOG_TRIVIAL(error) << "FullColor Final Export: skipped, final_gcode_path is empty";
+        if (preview_gcode_path.empty()) {
+            BOOST_LOG_TRIVIAL(error) << "FullColor Slice Preview: skipped, preview_gcode_path is empty";
             return;
         }
 
-        const boost::filesystem::path final_path(final_gcode_path);
-
-        BOOST_LOG_TRIVIAL(error)
-            << "FullColor Final Export: generating Chroma package for final path="
-            << final_gcode_path;
+        BOOST_LOG_TRIVIAL(info)
+            << "FullColor Slice Preview: generating Chroma sidecar for preview path="
+            << preview_gcode_path;
 
         const Slic3r::FullColor::RasterPipelineOutput chroma_output =
-            Slic3r::FullColor::generate_full_color_rasters(*fff_print, final_gcode_path);
+            Slic3r::FullColor::generate_full_color_rasters(*fff_print, preview_gcode_path);
 
-        BOOST_LOG_TRIVIAL(error)
-            << "FullColor Final Export: generated="
+        BOOST_LOG_TRIVIAL(info)
+            << "FullColor Slice Preview: generated="
             << (chroma_output.generated ? "true" : "false")
             << ", output="
             << chroma_output.output_dir;
-
-        // In full-colour mode the user-facing deliverable is the .chroma package,
-        // not a loose .gcode plus sidecar files. Keep the .gcode only if Chroma
-        // generation failed, so the user is not left with no export at all.
-        if (chroma_output.generated) {
-            boost::system::error_code ec;
-
-            if (boost::filesystem::exists(final_path, ec)) {
-                boost::filesystem::remove(final_path, ec);
-                if (ec) {
-                    BOOST_LOG_TRIVIAL(error)
-                        << "FullColor Final Export: failed to remove loose G-code '"
-                        << final_path.string() << "': " << ec.message();
-                } else {
-                    BOOST_LOG_TRIVIAL(info)
-                        << "FullColor Final Export: removed loose G-code after packaging: "
-                        << final_path.string();
-                }
-            }
-
-            // Remove old temporary debug marker if a previous debug build created it.
-            boost::filesystem::path old_marker(final_path);
-            old_marker += ".fullcolor_final_export_hook.txt";
-            if (boost::filesystem::exists(old_marker, ec)) {
-                boost::filesystem::remove(old_marker, ec);
-                if (ec) {
-                    BOOST_LOG_TRIVIAL(error)
-                        << "FullColor Final Export: failed to remove debug marker '"
-                        << old_marker.string() << "': " << ec.message();
-                }
-            }
-        }
     } catch (const std::exception& e) {
         BOOST_LOG_TRIVIAL(error)
-            << "FullColor Final Export: exception: "
+            << "FullColor Slice Preview: exception: "
             << e.what();
     } catch (...) {
-        BOOST_LOG_TRIVIAL(error) << "FullColor Final Export: unknown exception";
+        BOOST_LOG_TRIVIAL(error) << "FullColor Slice Preview: unknown exception";
+    }
+}
+
+static boost::filesystem::path full_color_chroma_sidecar_path_for_gcode(const std::string& gcode_path)
+{
+    const boost::filesystem::path path(gcode_path);
+    if (path.empty() || path.stem().empty())
+        return {};
+    return path.parent_path() / (path.stem().string() + ".chroma");
+}
+
+static boost::filesystem::path full_color_export_chroma_path(const std::string& export_path)
+{
+    boost::filesystem::path path(export_path);
+    path.replace_extension(".chroma");
+    return path;
+}
+
+static bool copy_full_color_chroma_export(
+    const Slic3r::Print* fff_print,
+    const std::string& source_gcode_path,
+    const std::string& requested_export_path,
+    bool export_path_on_removable_media,
+    std::string& exported_chroma_path
+)
+{
+    if (fff_print == nullptr || !fff_print->config().enable_full_color_printing.value)
+        return false;
+
+    const boost::filesystem::path source_chroma = full_color_chroma_sidecar_path_for_gcode(source_gcode_path);
+    const boost::filesystem::path target_chroma = full_color_export_chroma_path(requested_export_path);
+
+    BOOST_LOG_TRIVIAL(info)
+        << "FullColor Export: source_gcode=" << source_gcode_path
+        << ", source_chroma=" << source_chroma.string()
+        << ", target_chroma=" << target_chroma.string();
+
+    if (source_chroma.empty() || !boost::filesystem::exists(source_chroma)) {
+        throw Slic3r::ExportError(Slic3r::GUI::format(
+            _L("Full-color printing is enabled, but the sliced .chroma package was not found.\nExpected package: %1%"),
+            source_chroma.string()));
+    }
+
+    std::string error_message;
+    const int copy_ret_val = Slic3r::copy_file(source_chroma.string(), target_chroma.string(), error_message, export_path_on_removable_media);
+    switch (copy_ret_val) {
+    case Slic3r::CopyFileResult::SUCCESS:
+        exported_chroma_path = target_chroma.string();
+        BOOST_LOG_TRIVIAL(info) << "FullColor Export: copied Chroma package to " << exported_chroma_path;
+        return true;
+    case Slic3r::CopyFileResult::FAIL_COPY_FILE:
+        throw Slic3r::ExportError(Slic3r::GUI::format(_L("Copying of the temporary .chroma package to the output path failed.\nError message: %1%"), error_message));
+    case Slic3r::CopyFileResult::FAIL_FILES_DIFFERENT:
+        throw Slic3r::ExportError(Slic3r::GUI::format(_L("Copying of the temporary .chroma package failed. The corrupted output package is at %1%.tmp."), target_chroma.string()));
+    case Slic3r::CopyFileResult::FAIL_RENAMING:
+        throw Slic3r::ExportError(Slic3r::GUI::format(_L("Renaming of the .chroma package after copying failed. Current path is %1%.tmp."), target_chroma.string()));
+    case Slic3r::CopyFileResult::FAIL_CHECK_ORIGIN_NOT_OPENED:
+        throw Slic3r::ExportError(Slic3r::GUI::format(_L("Copying of the temporary .chroma package finished but the source package at %1% couldn't be opened during copy check."), source_chroma.string()));
+    case Slic3r::CopyFileResult::FAIL_CHECK_TARGET_NOT_OPENED:
+        throw Slic3r::ExportError(Slic3r::GUI::format(_L("Copying of the temporary .chroma package finished but the exported package couldn't be opened during copy check. The output package is at %1%.tmp."), target_chroma.string()));
+    default:
+        throw Slic3r::ExportError(Slic3r::GUI::format(_L("Failed to save .chroma package.\nError message: %1%.\nSource package %2%."), error_message, source_chroma.string()));
     }
 }
 
@@ -319,6 +346,7 @@ void BackgroundSlicingProcess::process_fff()
 		m_fff_print->export_gcode(m_temp_output_path, m_gcode_result, [this](const ThumbnailsParams& params) { return this->render_thumbnails(params); });
 		if(m_fff_print->is_BBL_printer())
 			run_post_process_scripts(m_temp_output_path, false, "File", m_temp_output_path, m_fff_print->full_print_config());
+		generate_full_color_chroma_for_slice_preview(m_fff_print, m_temp_output_path);
 
 		BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": export gcode finished");
 	}
@@ -866,11 +894,18 @@ bool BackgroundSlicingProcess::invalidate_all_steps()
 // Copy the final G-code to target location (possibly a SD card, if it is a removable media, then verify that the file was written without an error).
 void BackgroundSlicingProcess::finalize_gcode()
 {
-	m_print->set_status(95, _u8L("Running post-processing scripts"));
-
 	// Perform the final post-processing of the export path by applying the print statistics over the file name.
 	std::string export_path = m_fff_print->print_statistics().finalize_output_path(m_export_path);
 	std::string output_path = m_temp_output_path;
+
+	std::string exported_chroma_path;
+	if (copy_full_color_chroma_export(m_fff_print, output_path, export_path, m_export_path_on_removable_media, exported_chroma_path)) {
+		m_print->set_status(100, GUI::format(_L("Chroma package exported to %1%"), exported_chroma_path));
+		return;
+	}
+
+	m_print->set_status(95, _u8L("Running post-processing scripts"));
+
 	// Both output_path and export_path ar in-out parameters.
 	// If post processed, output_path will differ from m_temp_output_path as run_post_process_scripts() will make a copy of the G-code to not
 	// collide with the G-code viewer memory mapping of the unprocessed G-code. G-code viewer maps unprocessed G-code, because m_gcode_result 
@@ -894,8 +929,6 @@ void BackgroundSlicingProcess::finalize_gcode()
 	{
 		copy_ret_val = copy_file(output_path, export_path, error_message, m_export_path_on_removable_media);
 
-		if (copy_ret_val == SUCCESS)
-			generate_full_color_chroma_for_final_export(m_fff_print, export_path);
 		remove_post_processed_temp_file();
 	}
 	catch (...)
@@ -938,14 +971,22 @@ void BackgroundSlicingProcess::export_gcode()
 	std::string export_path = m_fff_print->print_statistics().finalize_output_path(m_export_path);
 	std::string output_path = m_temp_output_path;
 
+	std::string exported_chroma_path;
+	if (copy_full_color_chroma_export(m_fff_print, output_path, export_path, m_export_path_on_removable_media, exported_chroma_path)) {
+		auto evt = new wxCommandEvent(m_event_export_finished_id, GUI::wxGetApp().mainframe->m_plater->GetId());
+		wxString output_chroma_str = wxString::FromUTF8(exported_chroma_path.c_str(), exported_chroma_path.length());
+		evt->SetString(output_chroma_str);
+		wxQueueEvent(GUI::wxGetApp().mainframe->m_plater, evt);
+		m_print->set_status(100, GUI::format(_L("Chroma package exported to %1%"), exported_chroma_path));
+		return;
+	}
+
 	//FIXME localize the messages
 	std::string error_message;
 	int copy_ret_val = CopyFileResult::SUCCESS;
 	try
 	{
 		copy_ret_val = copy_file(output_path, export_path, error_message, m_export_path_on_removable_media);
-		if (copy_ret_val == SUCCESS)
-			generate_full_color_chroma_for_final_export(m_fff_print, export_path);
 			
 	}
 	catch (...)

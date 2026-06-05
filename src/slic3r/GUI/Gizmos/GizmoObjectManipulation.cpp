@@ -116,6 +116,8 @@ void GizmoObjectManipulation::update_settings_value(const Selection &selection)
     if (selection.is_single_full_instance()) {
         // all volumes in the selection belongs to the same instance, any of them contains the needed instance data, so we take the first one
         const GLVolume* volume = selection.get_first_volume();
+        if (volume == nullptr)
+            return;
         m_new_position = volume->get_instance_offset();
         auto rotation = volume->get_instance_transformation().get_rotation_by_quaternion();
         m_new_absolute_rotation = rotation * (180. / M_PI);

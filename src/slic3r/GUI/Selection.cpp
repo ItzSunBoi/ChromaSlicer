@@ -818,16 +818,20 @@ bool Selection::is_any_cut_volume() const
 
 bool Selection::is_single_full_instance() const
 {
+    if (!m_valid || m_volumes == nullptr || m_model == nullptr || m_list.empty() || m_volumes->empty())
+        return false;
+
+    for (unsigned int i : m_list)
+        if (i >= static_cast<unsigned int>(m_volumes->size()) || (*m_volumes)[i] == nullptr)
+            return false;
+
     if (m_type == SingleFullInstance)
         return true;
 
     if (m_type == SingleFullObject)
         return get_instance_idx() != -1;
 
-    if (m_list.empty() || m_volumes->empty())
-        return false;
-
-    int object_idx = m_valid ? get_object_idx() : -1;
+    int object_idx = get_object_idx();
     if (object_idx < 0 || (int)m_model->objects.size() <= object_idx)
         return false;
 
@@ -954,12 +958,12 @@ const Selection::InstanceIdxsList& Selection::get_instance_idxs() const
 
 const GLVolume* Selection::get_volume(unsigned int volume_idx) const
 {
-    return (m_valid && (volume_idx < (unsigned int)m_volumes->size())) ? (*m_volumes)[volume_idx] : nullptr;
+    return (m_valid && m_volumes != nullptr && volume_idx < (unsigned int)m_volumes->size()) ? (*m_volumes)[volume_idx] : nullptr;
 }
 
 GLVolume* Selection::get_volume(unsigned int volume_idx)
 {
-    return (m_valid && (volume_idx < (unsigned int)m_volumes->size())) ? (*m_volumes)[volume_idx] : nullptr;
+    return (m_valid && m_volumes != nullptr && volume_idx < (unsigned int)m_volumes->size()) ? (*m_volumes)[volume_idx] : nullptr;
 }
 
 const BoundingBoxf3& Selection::get_bounding_box() const
@@ -2287,8 +2291,17 @@ void Selection::update_type()
     m_cache.content.clear();
     m_type = Mixed;
 
+    if (!m_valid || m_volumes == nullptr || m_model == nullptr) {
+        m_type = Invalid;
+        return;
+    }
+
     for (unsigned int i : m_list)
     {
+        if (i >= static_cast<unsigned int>(m_volumes->size()) || (*m_volumes)[i] == nullptr) {
+            m_type = Invalid;
+            return;
+        }
         const GLVolume* volume = (*m_volumes)[i];
         int obj_idx = volume->object_idx();
         int inst_idx = volume->instance_idx();
@@ -2301,9 +2314,7 @@ void Selection::update_type()
 
     bool requires_disable = false;
 
-    if (!m_valid)
-        m_type = Invalid;
-    else
+    if (m_valid)
     {
         if (m_list.empty())
             m_type = Empty;

@@ -5426,12 +5426,46 @@ void Plater::priv::update(unsigned int flags)
         // Update the SLAPrint from the current Model, so that the reload_scene()
         // pulls the correct data.
         update_status = this->update_background_process(false, flags & (unsigned int)UpdateParams::POSTPONE_VALIDATION_ERROR_MESSAGE);
-    //BBS TODO reload_scene
-    this->view3D->reload_scene(false, flags & (unsigned int)UpdateParams::FORCE_FULL_SCREEN_REFRESH);
-    if (is_preview_shown()) this->preview->reload_print();
-    //BBS assemble view
-    this->assemble_view->reload_scene(false, flags);
+   
+    // BBS TODO reload_scene
+    // FullColor/preview safety: during startup preset loading, Plater::on_config_change()
+    // can call update() before all GL canvases are fully constructed. Avoid calling into
+    // GLCanvas3D::set_config() through reload_scene() on a null canvas.
+    const bool view3d_ready =
+        this->view3D != nullptr &&
+        this->view3D->get_canvas3d() != nullptr;
 
+    const bool preview_ready =
+        this->preview != nullptr &&
+        this->preview->get_canvas3d() != nullptr;
+
+    const bool assemble_ready =
+        this->assemble_view != nullptr &&
+        this->assemble_view->get_canvas3d() != nullptr;
+
+    if (view3d_ready) {
+        this->view3D->reload_scene(
+            false,
+            flags & (unsigned int) UpdateParams::FORCE_FULL_SCREEN_REFRESH
+        );
+    } else {
+        BOOST_LOG_TRIVIAL(warning)
+            << "Plater::priv::update: skipped view3D reload because canvas is not ready";
+    }
+
+    if (is_preview_shown() && preview_ready) {
+        this->preview->reload_print();
+    } else if (is_preview_shown()) {
+        BOOST_LOG_TRIVIAL(warning)
+            << "Plater::priv::update: skipped preview reload because canvas is not ready";
+    }
+
+    if (assemble_ready) {
+        this->assemble_view->reload_scene(false, flags);
+    } else {
+        BOOST_LOG_TRIVIAL(warning)
+            << "Plater::priv::update: skipped assemble view reload because canvas is not ready";
+    }
     if (current_panel && is_preview_shown()) {
         q->force_update_all_plate_thumbnails();
         //update_fff_scene_only_shells(true);
@@ -7679,9 +7713,16 @@ void Plater::priv::schedule_background_process()
     // Trigger the timer event after 0.5s
     this->background_process_timer.Start(500, wxTIMER_ONE_SHOT);
     // Notify the Canvas3D that something has changed, so it may invalidate some of the layer editing stuff.
-    this->view3D->get_canvas3d()->set_config(this->config);
+    if (this->view3D != nullptr) {
+        if (GLCanvas3D* canvas = this->view3D->get_canvas3d()) {
+            if (canvas->is_initialized()) {
+                canvas->set_config(this->config);
+            }
+        } else {
+            BOOST_LOG_TRIVIAL(warning) << "Plater::priv::schedule_background_process: view3D canvas is not ready";
+        }
+    }
 }
-
 void Plater::priv::schedule_auto_reslice_if_needed()
 {
     AppConfig* cfg = wxGetApp().app_config;
@@ -10909,26 +10950,30 @@ int Plater::get_publish_finished_event()
 
 void Plater::priv::set_current_canvas_as_dirty()
 {
-    if (current_panel == view3D)
+    if (current_panel == view3D && view3D != nullptr)
         view3D->set_as_dirty();
-    else if (current_panel == preview)
+    else if (current_panel == preview && preview != nullptr)
         preview->set_as_dirty();
-    else if (current_panel == assemble_view)
+    else if (current_panel == assemble_view && assemble_view != nullptr)
         assemble_view->set_as_dirty();
 }
 
 GLCanvas3D* Plater::priv::get_current_canvas3D(bool exclude_preview)
 {
-    if (current_panel == view3D)
-        return view3D->get_canvas3d();
-    else if (!exclude_preview && (current_panel == preview))
-        return preview->get_canvas3d();
-    else if (current_panel == assemble_view)
-        return assemble_view->get_canvas3d();
-    else //BBS default set to view3D
+    if (current_panel == view3D && view3D != nullptr)
         return view3D->get_canvas3d();
 
-    //return (current_panel == view3D) ? view3D->get_canvas3d() : ((current_panel == preview) ? preview->get_canvas3d() : nullptr);
+    if (!exclude_preview && current_panel == preview && preview != nullptr)
+        return preview->get_canvas3d();
+
+    if (current_panel == assemble_view && assemble_view != nullptr)
+        return assemble_view->get_canvas3d();
+
+    // BBS default set to view3D, but only if it exists.
+    if (view3D != nullptr)
+        return view3D->get_canvas3d();
+
+    return nullptr;
 }
 
 void Plater::priv::unbind_canvas_event_handlers()
@@ -14825,6 +14870,10 @@ void Plater::export_gcode(bool prefer_removable)
         return;
     }
     default_output_file = fs::path(Slic3r::fold_utf8_to_ascii(default_output_file.string()));
+    const bool full_color_export = printer_technology() == ptFFF && this->p->fff_print.config().enable_full_color_printing.value;
+    if (full_color_export)
+        default_output_file.replace_extension(".chroma");
+
     AppConfig 				&appconfig 				 = *wxGetApp().app_config;
     RemovableDriveManager 	&removable_drive_manager = *wxGetApp().removable_drive_manager();
     // Get a last save path, either to removable media or to an internal media.
@@ -14840,14 +14889,22 @@ void Plater::export_gcode(bool prefer_removable)
     fs::path output_path;
     {
         std::string ext = default_output_file.extension().string();
-        wxFileDialog dlg(this, (printer_technology() == ptFFF) ? _L("Save G-code file as:") : _L("Save SLA file as:"),
+        const wxString dialog_title = full_color_export ?
+            _L("Save Chroma package as:") :
+            ((printer_technology() == ptFFF) ? _L("Save G-code file as:") : _L("Save SLA file as:"));
+        const wxString wildcard = full_color_export ?
+            wxString("Chroma package (*.chroma)|*.chroma") :
+            GUI::file_wildcards((printer_technology() == ptFFF) ? FT_GCODE : FT_SL1, ext);
+        wxFileDialog dlg(this, dialog_title,
             start_dir,
             from_path(default_output_file.filename()),
-            GUI::file_wildcards((printer_technology() == ptFFF) ? FT_GCODE : FT_SL1, ext),
+            wildcard,
             wxFD_SAVE | wxFD_OVERWRITE_PROMPT
         );
         if (dlg.ShowModal() == wxID_OK) {
             output_path = into_path(dlg.GetPath());
+            if (full_color_export)
+                output_path.replace_extension(".chroma");
             while (has_illegal_filename_characters(output_path.filename().string())) {
                 show_error(this, _L("The provided file name is not valid.") + "\n" +
                     _L("The following characters are not allowed by a FAT file system:") + " <>:/\\|?*\"");
@@ -14858,6 +14915,8 @@ void Plater::export_gcode(bool prefer_removable)
                     output_path.clear();
                     break;
                 }
+                if (full_color_export)
+                    output_path.replace_extension(".chroma");
             }
         }
     }
@@ -16620,8 +16679,13 @@ void Plater::on_config_change(const DynamicPrintConfig &config)
             // print technology is changed, so we should to update a search list
             p->sidebar->update_searcher();
             p->reset_gcode_toolpaths();
-            p->view3D->get_canvas3d()->reset_sequential_print_clearance();
-            p->preview->get_canvas3d()->reset_volumes();
+            
+            if (p->view3D != nullptr && p->view3D->get_canvas3d() != nullptr)
+                p->view3D->get_canvas3d()->reset_sequential_print_clearance();
+
+            if (p->preview != nullptr && p->preview->get_canvas3d() != nullptr)
+                p->preview->get_canvas3d()->reset_volumes();
+
             //BBS: invalid all the slice results
             p->partplate_list.invalid_all_slice_result();
         }

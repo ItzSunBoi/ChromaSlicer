@@ -1,0 +1,42 @@
+diff --git a/src/slic3r/GUI/GLCanvas3D.cpp b/src/slic3r/GUI/GLCanvas3D.cpp
+--- a/src/slic3r/GUI/GLCanvas3D.cpp
++++ b/src/slic3r/GUI/GLCanvas3D.cpp
+@@ -1160,12 +1160,16 @@ int GLCanvas3D::GetHoverId()
+ 
+ }
+ 
+-PrinterTechnology GLCanvas3D::current_printer_technology() const {
+-    if (m_process == nullptr)
+-        return ptFFF;
+-
+-    return m_process->current_printer_technology();
++PrinterTechnology GLCanvas3D::current_printer_technology() const
++{
++    // This may be called during early macOS startup before m_process is safely
++    // attached to the canvas. Avoid dereferencing m_process here; crash reports
++    // show it may be invalid/stale, not only nullptr.
++    if (wxGetApp().preset_bundle != nullptr)
++        return wxGetApp().preset_bundle->printers.get_edited_preset().is_sla() ? ptSLA : ptFFF;
++
++    return ptFFF;
+ }
+ 
+ GLCanvas3D::GLCanvas3D(wxGLCanvas* canvas, Bed3D &bed)
+@@ -2540,10 +2544,12 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
+     // FFF is the safe fallback for early scene construction. Once the background
+     // process is fully attached, later reloads/slicing paths can use the real process
+     // state again.
+-    PrinterTechnology ptech = ptFFF;
+-    const auto& printer_preset = wxGetApp().preset_bundle->printers.get_edited_preset();
+-    if (printer_preset.is_sla())
+-        ptech = ptSLA;
++    PrinterTechnology printer_technology = ptFFF;
++
++    if (wxGetApp().preset_bundle != nullptr) {
++        const auto& printer_preset = wxGetApp().preset_bundle->printers.get_edited_preset();
++        if (printer_preset.is_sla())
++            printer_technology = ptSLA;
++    }
+ 
+     // BBS: support wipe tower for multi-plates
+     PartPlateList& ppl = wxGetApp().plater()->get_partplate_list();

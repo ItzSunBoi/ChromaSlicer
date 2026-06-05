@@ -16,6 +16,7 @@
 #include <zlib.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -26,6 +27,8 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
 #include <unordered_map>
 #include <vector>
 
@@ -34,10 +37,21 @@ namespace Slic3r::FullColor {
 namespace {
 
 using json = nlohmann::json;
+using RasterClock = std::chrono::steady_clock;
 
 static constexpr double FULL_COLOR_PIXEL_SIZE_MM        = 0.0846667; // ~300 DPI
 static constexpr double FULL_COLOR_NORMAL_TOLERANCE_MM = 0.02;
 static constexpr bool   FULL_COLOR_OBJ_FLIP_V          = true;
+static constexpr bool   FULL_COLOR_CPU_TEXTURE_FLIP_V  = false;
+static constexpr const char *FULL_COLOR_TEXTURE_ADDRESS_MODE = "clamp_to_edge";
+static constexpr const char *FULL_COLOR_TEXTURE_BUFFER_ORIGIN = "bottom-left";
+
+enum class RasterDebugMode
+{
+    Normal,
+    UV,
+    Triangle
+};
 
 struct TextureBitmap
 {
@@ -52,6 +66,8 @@ struct RasterTriangle
     Vec3d p0;
     Vec3d p1;
     Vec3d p2;
+    Vec3d min_pt;
+    Vec3d max_pt;
     Vec3d normal;
     std::array<Vec2f, 3> uv;
     RGBA fallback_color;
@@ -100,9 +116,109 @@ struct TriangleGrid
     std::unordered_map<GridKey, std::vector<size_t>, GridKeyHash> cells;
 };
 
+struct LayerDebugCounters
+{
+    size_t total_pixels = 0;
+    size_t colored_pixels = 0;
+    size_t candidate_misses = 0;
+    size_t candidate_triangle_tests = 0;
+    size_t accepted_triangle_hits = 0;
+    size_t subpixel_edge_hits = 0;
+    size_t vertical_projected_samples = 0;
+    size_t closest_point_samples = 0;
+    size_t rejected_by_xy_projection = 0;
+    size_t rejected_by_shell_distance = 0;
+    size_t rejected_by_normal = 0;
+    size_t invalid_uv_texture = 0;
+};
+
+struct LayerPixelBounds
+{
+    int min_x = 0;
+    int max_x = -1;
+    int min_y = 0;
+    int max_y = -1;
+
+    bool empty() const { return max_x < min_x || max_y < min_y; }
+};
+
+struct RasterTiming
+{
+    double total_ms = 0.0;
+    double surface_prep_ms = 0.0;
+    double grid_build_ms = 0.0;
+    double layer_raster_total_ms = 0.0;
+    double layer_average_ms = 0.0;
+    double slowest_layer_ms = 0.0;
+    double staging_ms = 0.0;
+    double manifest_ms = 0.0;
+    double packaging_ms = 0.0;
+};
+
+static double elapsed_ms(const RasterClock::time_point &start, const RasterClock::time_point &end = RasterClock::now())
+{
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+static void add_counters(LayerDebugCounters &dst, const LayerDebugCounters &src)
+{
+    dst.total_pixels += src.total_pixels;
+    dst.colored_pixels += src.colored_pixels;
+    dst.candidate_misses += src.candidate_misses;
+    dst.candidate_triangle_tests += src.candidate_triangle_tests;
+    dst.accepted_triangle_hits += src.accepted_triangle_hits;
+    dst.subpixel_edge_hits += src.subpixel_edge_hits;
+    dst.vertical_projected_samples += src.vertical_projected_samples;
+    dst.closest_point_samples += src.closest_point_samples;
+    dst.rejected_by_xy_projection += src.rejected_by_xy_projection;
+    dst.rejected_by_shell_distance += src.rejected_by_shell_distance;
+    dst.rejected_by_normal += src.rejected_by_normal;
+    dst.invalid_uv_texture += src.invalid_uv_texture;
+}
+
+static RasterDebugMode raster_debug_mode()
+{
+    const char *env = std::getenv("ORCA_FULL_COLOR_RASTER_DEBUG");
+    if (env == nullptr)
+        return RasterDebugMode::Normal;
+
+    const std::string value(env);
+    if (value == "uv" || value == "UV")
+        return RasterDebugMode::UV;
+    if (value == "triangle" || value == "triangles")
+        return RasterDebugMode::Triangle;
+    return RasterDebugMode::Normal;
+}
+
+static const char *raster_debug_mode_name(RasterDebugMode mode)
+{
+    switch (mode) {
+    case RasterDebugMode::UV:       return "uv";
+    case RasterDebugMode::Triangle: return "triangle";
+    case RasterDebugMode::Normal:
+    default:                        return "normal";
+    }
+}
+
+static const char *raster_debug_mode_manifest_name(RasterDebugMode mode)
+{
+    return mode == RasterDebugMode::Normal ? "none" : raster_debug_mode_name(mode);
+}
+
 static std::uint8_t to_u8(float value)
 {
     return static_cast<std::uint8_t>(std::clamp(value, 0.0f, 1.0f) * 255.0f + 0.5f);
+}
+
+static RGBA triangle_debug_color(size_t triangle_index)
+{
+    const uint32_t h = static_cast<uint32_t>(triangle_index * 2654435761u);
+    return RGBA{
+        ((h >> 16) & 0xff) / 255.0f,
+        ((h >> 8) & 0xff) / 255.0f,
+        (h & 0xff) / 255.0f,
+        1.0f
+    };
 }
 
 static bool load_texture_bitmap(const TextureImage &texture, TextureBitmap &bitmap)
@@ -162,12 +278,13 @@ static RGBA sample_texture_bilinear(const TextureBitmap &bitmap, const Vec2f &uv
     double u = static_cast<double>(uv.x());
     double v = static_cast<double>(uv.y());
 
-    u = u - std::floor(u);
-    v = v - std::floor(v);
+    u = std::clamp(u, 0.0, 1.0);
+    v = std::clamp(v, 0.0, 1.0);
 
-    // OBJ/MTL UVs use a bottom-left texture origin in most exporters, while PNG rows are top-down.
-    // Match the earlier prototype and typical OBJ raster convention by flipping V on CPU raster sampling.
-    if (FULL_COLOR_OBJ_FLIP_V)
+    // PNGReadWrite stores colored PNG rows bottom-up for historical slicer preview code.
+    // That already matches OBJ's bottom-left V convention, so the CPU sampler must not
+    // apply the viewport's GL upload flip a second time.
+    if (FULL_COLOR_CPU_TEXTURE_FLIP_V)
         v = 1.0 - v;
 
     const double fx = u * static_cast<double>(bitmap.width  - 1);
@@ -268,6 +385,38 @@ static Vec3d barycentric_coords(const Vec3d &p, const Vec3d &a, const Vec3d &b, 
     return Vec3d(u, v, w);
 }
 
+static bool barycentric_coords_xy(const Vec3d &p, const Vec3d &a, const Vec3d &b, const Vec3d &c, Vec3d &out)
+{
+    const double v0x = b.x() - a.x();
+    const double v0y = b.y() - a.y();
+    const double v1x = c.x() - a.x();
+    const double v1y = c.y() - a.y();
+    const double v2x = p.x() - a.x();
+    const double v2y = p.y() - a.y();
+    const double denom = v0x * v1y - v1x * v0y;
+
+    if (std::abs(denom) <= 1e-12)
+        return false;
+
+    const double v = (v2x * v1y - v1x * v2y) / denom;
+    const double w = (v0x * v2y - v2x * v0y) / denom;
+    const double u = 1.0 - v - w;
+    out = Vec3d(u, v, w);
+    return true;
+}
+
+static bool barycentric_inside_triangle(const Vec3d &bary)
+{
+    static constexpr double eps = 1e-6;
+    return bary.x() >= -eps && bary.y() >= -eps && bary.z() >= -eps &&
+           bary.x() <= 1.0 + eps && bary.y() <= 1.0 + eps && bary.z() <= 1.0 + eps;
+}
+
+static Vec3d point_from_barycentric(const Vec3d &bary, const Vec3d &a, const Vec3d &b, const Vec3d &c)
+{
+    return a * bary.x() + b * bary.y() + c * bary.z();
+}
+
 static std::vector<LayerRasterInfo> collect_layers(const Print &print)
 {
     std::vector<LayerRasterInfo> layers;
@@ -329,18 +478,59 @@ static TriangleGrid build_triangle_grid(const std::vector<RasterTriangle> &trian
     return grid;
 }
 
+static LayerPixelBounds layer_pixel_bounds(
+    const std::vector<RasterTriangle> &triangles,
+    const Vec3d &min_pt,
+    int width,
+    int height,
+    double z,
+    double shell_thickness)
+{
+    LayerPixelBounds bounds;
+    bounds.min_x = width;
+    bounds.min_y = height;
+    bounds.max_x = -1;
+    bounds.max_y = -1;
+
+    for (const RasterTriangle &tri : triangles) {
+        if (z < tri.min_pt.z() - shell_thickness || z > tri.max_pt.z() + shell_thickness)
+            continue;
+
+        const double min_x = tri.min_pt.x() - shell_thickness;
+        const double max_x = tri.max_pt.x() + shell_thickness;
+        const double min_y = tri.min_pt.y() - shell_thickness;
+        const double max_y = tri.max_pt.y() + shell_thickness;
+
+        const int x0 = std::clamp(static_cast<int>(std::floor((min_x - min_pt.x()) / FULL_COLOR_PIXEL_SIZE_MM)) - 1, 0, width - 1);
+        const int x1 = std::clamp(static_cast<int>(std::ceil ((max_x - min_pt.x()) / FULL_COLOR_PIXEL_SIZE_MM)) + 1, 0, width - 1);
+        const int y0 = std::clamp(static_cast<int>(std::floor((min_y - min_pt.y()) / FULL_COLOR_PIXEL_SIZE_MM)) - 1, 0, height - 1);
+        const int y1 = std::clamp(static_cast<int>(std::ceil ((max_y - min_pt.y()) / FULL_COLOR_PIXEL_SIZE_MM)) + 1, 0, height - 1);
+
+        bounds.min_x = std::min(bounds.min_x, x0);
+        bounds.max_x = std::max(bounds.max_x, x1);
+        bounds.min_y = std::min(bounds.min_y, y0);
+        bounds.max_y = std::max(bounds.max_y, y1);
+    }
+
+    return bounds;
+}
+
 static bool sample_best_triangle(
     const std::vector<RasterTriangle> &triangles,
     const std::vector<TextureBitmap> &textures,
     const TriangleGrid &grid,
     const Vec3d &query,
     double shell_thickness,
+    RasterDebugMode debug_mode,
+    LayerDebugCounters &counters,
     RGBA &out_color)
 {
     const GridKey key = grid_key(query, grid.cell_size);
     const auto it = grid.cells.find(key);
-    if (it == grid.cells.end())
+    if (it == grid.cells.end()) {
+        ++counters.candidate_misses;
         return false;
+    }
 
     const double shell_sq = shell_thickness * shell_thickness;
     double best_dist_sq = shell_sq;
@@ -350,50 +540,112 @@ static bool sample_best_triangle(
     for (const size_t tri_idx : it->second) {
         if (tri_idx >= triangles.size())
             continue;
+        ++counters.candidate_triangle_tests;
 
         const RasterTriangle &tri = triangles[tri_idx];
-        const Vec3d closest = closest_point_on_triangle(query, tri.p0, tri.p1, tri.p2);
-        const Vec3d delta = query - closest;
+        Vec3d bary;
+        Vec3d sample;
+        bool used_vertical_projection = false;
+
+        const bool has_xy_projection = barycentric_coords_xy(query, tri.p0, tri.p1, tri.p2, bary);
+        if (has_xy_projection && barycentric_inside_triangle(bary)) {
+            sample = point_from_barycentric(bary, tri.p0, tri.p1, tri.p2);
+            used_vertical_projection = true;
+        } else {
+            if (has_xy_projection)
+                ++counters.rejected_by_xy_projection;
+            sample = closest_point_on_triangle(query, tri.p0, tri.p1, tri.p2);
+            bary = barycentric_coords(sample, tri.p0, tri.p1, tri.p2);
+        }
+
+        const Vec3d delta = query - sample;
         const double normal_distance = delta.dot(tri.normal);
-        if (normal_distance > FULL_COLOR_NORMAL_TOLERANCE_MM)
+        if (normal_distance > FULL_COLOR_NORMAL_TOLERANCE_MM) {
+            ++counters.rejected_by_normal;
             continue;
+        }
 
         const double dist_sq = delta.squaredNorm();
+        if (dist_sq > shell_sq) {
+            ++counters.rejected_by_shell_distance;
+            continue;
+        }
         if (dist_sq > best_dist_sq)
             continue;
 
         RGBA color = tri.fallback_color;
-        if (tri.has_uv && tri.texture_index >= 0 && static_cast<size_t>(tri.texture_index) < textures.size()) {
+        const Vec2f uv = tri.uv[0] * static_cast<float>(bary.x()) +
+                         tri.uv[1] * static_cast<float>(bary.y()) +
+                         tri.uv[2] * static_cast<float>(bary.z());
+
+        if (debug_mode == RasterDebugMode::UV) {
+            if (!tri.has_uv) {
+                ++counters.invalid_uv_texture;
+                continue;
+            }
+            const float u = std::clamp(uv.x(), 0.0f, 1.0f);
+            const float v = std::clamp(uv.y(), 0.0f, 1.0f);
+            color = RGBA{
+                u,
+                v,
+                0.0f,
+                1.0f
+            };
+        } else if (debug_mode == RasterDebugMode::Triangle) {
+            color = triangle_debug_color(tri_idx);
+        } else if (tri.has_uv && tri.texture_index >= 0 && static_cast<size_t>(tri.texture_index) < textures.size()) {
             const TextureBitmap &texture = textures[static_cast<size_t>(tri.texture_index)];
-            const Vec3d bary = barycentric_coords(closest, tri.p0, tri.p1, tri.p2);
-            const Vec2f uv = tri.uv[0] * static_cast<float>(bary.x()) +
-                             tri.uv[1] * static_cast<float>(bary.y()) +
-                             tri.uv[2] * static_cast<float>(bary.z());
-            color = sample_texture_bilinear(texture, uv, color);
+            if (texture.pixels.empty())
+                ++counters.invalid_uv_texture;
+            else
+                color = sample_texture_bilinear(texture, uv, color);
         }
 
         best_dist_sq = dist_sq;
         best_color = color;
+        if (used_vertical_projection)
+            ++counters.vertical_projected_samples;
+        else
+            ++counters.closest_point_samples;
         found = true;
     }
 
     if (found)
         out_color = best_color;
+    if (found)
+        ++counters.accepted_triangle_hits;
     return found;
 }
 
-static bool looks_like_internal_metadata_path(const boost::filesystem::path &path)
+static bool sample_pixel_color(
+    const std::vector<RasterTriangle> &triangles,
+    const std::vector<TextureBitmap> &textures,
+    const TriangleGrid &grid,
+    const Vec3d &pixel_center,
+    double shell_thickness,
+    RasterDebugMode debug_mode,
+    LayerDebugCounters &counters,
+    RGBA &out_color)
 {
-    if (path.empty())
+    if (sample_best_triangle(triangles, textures, grid, pixel_center, shell_thickness, debug_mode, counters, out_color))
         return true;
 
-    const std::string parent = path.parent_path().filename().string();
-    const std::string stem = path.stem().string();
+    static constexpr double edge_offsets[][2] = {
+        {-0.35, -0.35}, { 0.35, -0.35}, {-0.35,  0.35}, { 0.35,  0.35},
+        {-0.35,  0.00}, { 0.35,  0.00}, { 0.00, -0.35}, { 0.00,  0.35}
+    };
 
-    if (parent == "Metadata")
-        return true;
-    if (!stem.empty() && stem.front() == '.')
-        return true;
+    for (const auto &offset : edge_offsets) {
+        const Vec3d query(
+            pixel_center.x() + offset[0] * FULL_COLOR_PIXEL_SIZE_MM,
+            pixel_center.y() + offset[1] * FULL_COLOR_PIXEL_SIZE_MM,
+            pixel_center.z());
+        if (sample_best_triangle(triangles, textures, grid, query, shell_thickness, debug_mode, counters, out_color)) {
+            ++counters.subpixel_edge_hits;
+            return true;
+        }
+    }
+
     return false;
 }
 
@@ -410,12 +662,12 @@ static boost::filesystem::path chroma_output_path_for_gcode(const std::string &g
 {
     const boost::filesystem::path gcode(gcode_path);
 
-    if (!gcode_path.empty() && !gcode.stem().empty() && !looks_like_internal_metadata_path(gcode)) {
-        reason = "final_gcode_path";
+    if (!gcode_path.empty() && !gcode.stem().empty()) {
+        reason = "gcode_sidecar_path";
         return gcode.parent_path() / (gcode.stem().string() + ".chroma");
     }
 
-    reason = gcode_path.empty() ? "missing_gcode_path" : "internal_or_hidden_metadata_path";
+    reason = "missing_gcode_path";
     const boost::filesystem::path fallback = fallback_chroma_output_path();
     BOOST_LOG_TRIVIAL(warning) << "FullColor Raster: no user-facing G-code output path available, using debug chroma=" << fallback.string();
     return fallback;
@@ -611,7 +863,11 @@ static std::string layer_basename(size_t layer_index)
 static void write_debug_log(
     const boost::filesystem::path &path,
     const std::string &output_reason,
+    RasterDebugMode debug_mode,
     size_t triangle_count,
+    size_t triangle_count_mesh,
+    size_t triangle_count_full_color_metadata,
+    bool triangle_mapping_validated,
     size_t grid_cells,
     size_t texture_count,
     size_t loaded_texture_count,
@@ -620,18 +876,30 @@ static void write_debug_log(
     const Vec3d &max_pt,
     int width,
     int height,
-    double shell_thickness)
+    double shell_thickness,
+    const RasterTiming &timing)
 {
     boost::nowide::ofstream out(path.string());
     out << "FullColor Raster Debug Log\n";
     out << "output_reason=" << output_reason << "\n";
-    out << "raster_strategy=closest-triangle-uniform-grid\n";
+    out << "raster_geometry_source=PrintObject::trafo_centered() * ModelVolume::get_matrix() * ModelVolume::mesh().its\n";
+    out << "viewport_geometry_source=ModelVolume::mesh().its, rendered through GLVolume instance/volume world_matrix\n";
+    out << "triangle_mapping_strategy=mesh triangle index matched to FullColor::SurfaceData::triangles index\n";
+    out << "triangle_mapping_validated=" << (triangle_mapping_validated ? "true" : "false") << "\n";
+    out << "coordinate_space=slicer object space with PrintInstance::shift_without_plate_offset applied in XY\n";
+    out << "raster_strategy=vertical-layer-projection-with-closest-point-fallback-uniform-grid\n";
+    out << "debug_mode=" << raster_debug_mode_name(debug_mode) << "\n";
     out << "texture_sampling=bilinear\n";
     out << "uv_flip_v=" << (FULL_COLOR_OBJ_FLIP_V ? "true" : "false") << "\n";
+    out << "cpu_texture_v_flip=" << (FULL_COLOR_CPU_TEXTURE_FLIP_V ? "true" : "false") << "\n";
+    out << "texture_address_mode=" << FULL_COLOR_TEXTURE_ADDRESS_MODE << "\n";
+    out << "texture_buffer_origin=" << FULL_COLOR_TEXTURE_BUFFER_ORIGIN << "\n";
     out << "pixel_size_mm=" << FULL_COLOR_PIXEL_SIZE_MM << "\n";
     out << "shell_thickness_mm=" << shell_thickness << "\n";
     out << "normal_tolerance_mm=" << FULL_COLOR_NORMAL_TOLERANCE_MM << "\n";
     out << "triangle_count=" << triangle_count << "\n";
+    out << "triangle_count_mesh=" << triangle_count_mesh << "\n";
+    out << "triangle_count_full_color_metadata=" << triangle_count_full_color_metadata << "\n";
     out << "grid_cells=" << grid_cells << "\n";
     out << "texture_count=" << texture_count << "\n";
     out << "loaded_texture_count=" << loaded_texture_count << "\n";
@@ -640,6 +908,15 @@ static void write_debug_log(
     out << "image_height=" << height << "\n";
     out << "bounds_min=" << min_pt.x() << "," << min_pt.y() << "," << min_pt.z() << "\n";
     out << "bounds_max=" << max_pt.x() << "," << max_pt.y() << "," << max_pt.z() << "\n";
+    out << "timing_total_ms=" << timing.total_ms << "\n";
+    out << "timing_surface_prep_ms=" << timing.surface_prep_ms << "\n";
+    out << "timing_grid_build_ms=" << timing.grid_build_ms << "\n";
+    out << "timing_layer_raster_total_ms=" << timing.layer_raster_total_ms << "\n";
+    out << "timing_layer_average_ms=" << timing.layer_average_ms << "\n";
+    out << "timing_slowest_layer_ms=" << timing.slowest_layer_ms << "\n";
+    out << "timing_staging_ms=" << timing.staging_ms << "\n";
+    out << "timing_manifest_ms=" << timing.manifest_ms << "\n";
+    out << "timing_packaging_ms=" << timing.packaging_ms << "\n";
 }
 
 } // namespace
@@ -700,6 +977,8 @@ RasterPipelineSummary collect_full_color_raster_summary(const Model &model, cons
 
 RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::string &gcode_path)
 {
+    const auto total_start = RasterClock::now();
+    RasterTiming timing;
     RasterPipelineOutput output;
     output.summary = collect_full_color_raster_summary(print.model(), print.config());
 
@@ -714,18 +993,25 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
     }
 
     const double shell_thickness = std::max(0.01, print.config().full_color_shell_thickness.value);
+    const RasterDebugMode debug_mode = raster_debug_mode();
     BOOST_LOG_TRIVIAL(info) << "FullColor Raster: generating layer rasters";
     BOOST_LOG_TRIVIAL(info) << "FullColor Raster: pixel_size=" << FULL_COLOR_PIXEL_SIZE_MM << " mm";
     BOOST_LOG_TRIVIAL(info) << "FullColor Raster: shell_thickness=" << shell_thickness << " mm";
     BOOST_LOG_TRIVIAL(info) << "FullColor Raster: shell_mode=normal-inward";
-    BOOST_LOG_TRIVIAL(info) << "FullColor Raster: raster_strategy=closest-triangle-uniform-grid";
+    BOOST_LOG_TRIVIAL(info) << "FullColor Raster: raster_strategy=vertical-layer-projection-with-closest-point-fallback-uniform-grid";
+    BOOST_LOG_TRIVIAL(info) << "FullColor Raster: debug_mode=" << raster_debug_mode_name(debug_mode);
 
     std::vector<RasterTriangle> triangles;
     triangles.reserve(output.summary.total_color_triangles);
     std::vector<TextureBitmap> textures;
     textures.reserve(output.summary.total_textures);
     size_t loaded_texture_count = 0;
+    size_t triangle_count_mesh = 0;
+    size_t triangle_count_full_color_metadata = 0;
+    size_t validated_volume_count = 0;
+    size_t skipped_mapping_mismatch_volume_count = 0;
 
+    const auto surface_prep_start = RasterClock::now();
     for (const PrintObject *print_object : print.objects()) {
         if (print_object == nullptr || print_object->model_object() == nullptr)
             continue;
@@ -751,6 +1037,16 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
 
                 const Transform3d transform = instance_transform * volume->get_matrix();
                 const indexed_triangle_set &its = volume->mesh().its;
+                triangle_count_mesh += its.indices.size();
+                triangle_count_full_color_metadata += surface.triangles.size();
+                if (surface.triangles.size() != its.indices.size()) {
+                    BOOST_LOG_TRIVIAL(warning) << "FullColor Raster: triangle metadata mismatch for volume; metadata="
+                                               << surface.triangles.size() << ", mesh=" << its.indices.size()
+                                               << "; skipping volume to avoid incorrect UV remapping";
+                    ++skipped_mapping_mismatch_volume_count;
+                    continue;
+                }
+                ++validated_volume_count;
                 const size_t triangle_count = std::min(surface.triangles.size(), its.indices.size());
                 for (size_t triangle_idx = 0; triangle_idx < triangle_count; ++triangle_idx) {
                     const stl_triangle_vertex_indices face = its.indices[triangle_idx];
@@ -766,9 +1062,21 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
                     tri.p0 = p0;
                     tri.p1 = p1;
                     tri.p2 = p2;
+                    tri.min_pt = p0.cwiseMin(p1).cwiseMin(p2);
+                    tri.max_pt = p0.cwiseMax(p1).cwiseMax(p2);
                     tri.normal = n_raw.normalized();
                     tri.uv = triangle_data.uv;
                     tri.fallback_color = triangle_data.fallback_color;
+                    if (!triangle_data.has_color && surface.has_vertex_colors &&
+                        static_cast<size_t>(face[0]) < surface.vertex_colors.size() &&
+                        static_cast<size_t>(face[1]) < surface.vertex_colors.size() &&
+                        static_cast<size_t>(face[2]) < surface.vertex_colors.size()) {
+                        RGBA average_color{0.0f, 0.0f, 0.0f, 0.0f};
+                        for (size_t corner = 0; corner < 3; ++corner)
+                            for (size_t channel = 0; channel < 4; ++channel)
+                                average_color[channel] += surface.vertex_colors[face[corner]][channel] / 3.0f;
+                        tri.fallback_color = average_color;
+                    }
                     tri.has_uv = triangle_data.has_uv;
                     tri.texture_index = triangle_data.texture_index >= 0 ?
                         static_cast<int>(texture_base + static_cast<size_t>(triangle_data.texture_index)) : -1;
@@ -777,6 +1085,7 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
             }
         }
     }
+    timing.surface_prep_ms = elapsed_ms(surface_prep_start);
 
     if (triangles.empty()) {
         BOOST_LOG_TRIVIAL(info) << "FullColor Raster: enabled, but no raster triangles could be generated";
@@ -798,7 +1107,9 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
         return output;
     }
 
+    const auto grid_build_start = RasterClock::now();
     const TriangleGrid triangle_grid = build_triangle_grid(triangles, shell_thickness);
+    timing.grid_build_ms = elapsed_ms(grid_build_start);
     BOOST_LOG_TRIVIAL(info) << "FullColor Raster: triangle_count=" << triangles.size()
                             << ", grid_cells=" << triangle_grid.cells.size()
                             << ", grid_cell_size=" << triangle_grid.cell_size << " mm";
@@ -810,18 +1121,22 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
     const boost::filesystem::path layer_dir = staging_dir / "layers";
     const boost::filesystem::path layer_metadata_dir = staging_dir / "layer_metadata";
 
+    const auto staging_start = RasterClock::now();
     boost::filesystem::create_directories(layer_dir);
     boost::filesystem::create_directories(layer_metadata_dir);
+    timing.staging_ms += elapsed_ms(staging_start);
 
     BOOST_LOG_TRIVIAL(info) << "FullColor Raster: staging=" << staging_dir.string();
     BOOST_LOG_TRIVIAL(info) << "FullColor Raster: chroma=" << chroma_path.string();
     BOOST_LOG_TRIVIAL(info) << "FullColor Raster: output_reason=" << output_reason;
     BOOST_LOG_TRIVIAL(info) << "FullColor Raster: layer_count=" << layers.size();
 
-    write_debug_log(staging_dir / "debug_log.txt", output_reason, triangles.size(), triangle_grid.cells.size(),
-                    textures.size(), loaded_texture_count, layers.size(), min_pt, max_pt, width, height, shell_thickness);
+    const bool triangle_mapping_validated =
+        validated_volume_count > 0 && skipped_mapping_mismatch_volume_count == 0 &&
+        triangle_count_mesh == triangle_count_full_color_metadata;
 
     if (!gcode_path.empty() && boost::filesystem::exists(gcode_path)) {
+        const auto copy_start = RasterClock::now();
         try {
             const boost::filesystem::path gcode_src(gcode_path);
             boost::filesystem::copy_file(
@@ -831,61 +1146,180 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
         } catch (const std::exception &e) {
             BOOST_LOG_TRIVIAL(error) << "FullColor Raster: failed to copy G-code into package staging: " << e.what();
         }
+        timing.staging_ms += elapsed_ms(copy_start);
     } else {
         BOOST_LOG_TRIVIAL(warning) << "FullColor Raster: G-code file not available for package root: " << gcode_path;
     }
 
+    const std::string gcode_filename = boost::filesystem::path(gcode_path).filename().string();
+    const double first_layer_height = layers.empty() ? 0.0 : layers.front().z1 - layers.front().z0;
+    const double nominal_layer_height = layers.size() > 1 ? layers[1].z1 - layers[0].z1 : first_layer_height;
+    const bool vertex_colors_present = std::any_of(print.model().objects.begin(), print.model().objects.end(), [](const ModelObject *object) {
+        if (object == nullptr)
+            return false;
+        return std::any_of(object->volumes.begin(), object->volumes.end(), [](const ModelVolume *volume) {
+            return volume != nullptr && volume->full_color_data && volume->full_color_data->has_vertex_colors;
+        });
+    });
+    const bool face_colors_present = std::any_of(print.model().objects.begin(), print.model().objects.end(), [](const ModelObject *object) {
+        if (object == nullptr)
+            return false;
+        return std::any_of(object->volumes.begin(), object->volumes.end(), [](const ModelVolume *volume) {
+            return volume != nullptr && volume->full_color_data && volume->full_color_data->has_face_colors;
+        });
+    });
+    const bool uv_triangles_present = std::any_of(triangles.begin(), triangles.end(), [](const RasterTriangle &tri) {
+        return tri.has_uv;
+    });
+
     json manifest;
-    manifest["format"] = "OrcaSlicerFullColorRaster";
-    manifest["version"] = 3;
-    manifest["raster_strategy"] = "closest-triangle-uniform-grid";
-    manifest["texture_sampling"] = "bilinear";
-    manifest["uv_flip_v"] = FULL_COLOR_OBJ_FLIP_V;
-    manifest["shell_mode"] = "normal-inward";
-    manifest["preview_scaffold"] = "Show full-color layers overlay is scaffolded; generated layer image paths are tracked in this manifest.";
-    manifest["settings"] = {
-        {"pixel_size_mm", FULL_COLOR_PIXEL_SIZE_MM},
-        {"shell_thickness_mm", shell_thickness},
-        {"normal_tolerance_mm", FULL_COLOR_NORMAL_TOLERANCE_MM}
+    manifest["format"] = "OrcaSlicerChroma";
+    manifest["version"] = 1;
+    manifest["generator"] = {
+        {"name", "OrcaSlicer"},
+        {"build", std::string(SLIC3R_VERSION)},
+        {"full_color_mvp", true}
     };
-    manifest["model_bounds"] = {
-        {"min", {min_pt.x(), min_pt.y(), min_pt.z()}},
-        {"max", {max_pt.x(), max_pt.y(), max_pt.z()}},
-        {"image_width", width},
-        {"image_height", height},
-        {"origin_xy_mm", {min_pt.x(), min_pt.y()}},
-        {"coordinate_origin", "min model bounds in print-bed XY, units mm"},
+    manifest["package"] = {
+        {"type", "chroma"},
+        {"container", "zip"},
+        {"gcode_file", gcode_filename},
+        {"layers_dir", "layers"},
+        {"layer_metadata_dir", "layer_metadata"},
+        {"debug_log", "debug_log.txt"}
+    };
+    manifest["source"] = {
+        {"source_color_formats", {"OBJ"}},
+        {"primary_model_format", "OBJ"},
+        {"texture_format_support", {"PNG"}},
+        {"known_deferred_formats", {
+            "3MF texture/color support",
+            "glTF/GLB textured mesh support",
+            "PLY vertex colors",
+            "VRML/X3D if useful"
+        }}
+    };
+    manifest["config"] = {
+        {"enable_full_color_printing", true},
+        {"full_color_shell_thickness_mm", shell_thickness},
+        {"full_color_pixel_size_mm", FULL_COLOR_PIXEL_SIZE_MM},
+        {"normal_tolerance_mm", FULL_COLOR_NORMAL_TOLERANCE_MM},
+        {"shell_mode", "normal-inward"},
+        {"raster_strategy", "vertical-layer-projection-with-closest-point-fallback-uniform-grid"},
+        {"texture_sampling", "bilinear"},
+        {"uv_flip_v", FULL_COLOR_OBJ_FLIP_V},
+        {"cpu_texture_v_flip", FULL_COLOR_CPU_TEXTURE_FLIP_V},
+        {"texture_address_mode", FULL_COLOR_TEXTURE_ADDRESS_MODE},
+        {"texture_buffer_origin", FULL_COLOR_TEXTURE_BUFFER_ORIGIN},
+        {"background", "white"},
+        {"units", "mm"}
+    };
+    manifest["print"] = {
+        {"layer_count", layers.size()},
+        {"first_layer_height_mm", first_layer_height},
+        {"layer_height_mm", nominal_layer_height},
+        {"plate_index", 0},
+        {"printer_profile", print.config().printer_model.value.empty() ? std::string("unknown") : print.config().printer_model.value},
+        {"filament_profile", "unknown"}
+    };
+    manifest["bounds"] = {
+        {"coordinate_space", "print-bed"},
+        {"origin", "min model bounds in print-bed XY"},
+        {"min_mm", {min_pt.x(), min_pt.y(), min_pt.z()}},
+        {"max_mm", {max_pt.x(), max_pt.y(), max_pt.z()}},
+        {"image_width_px", width},
+        {"image_height_px", height},
         {"image_row_0_y_mm", min_pt.y()},
-        {"image_y_flipped", false},
-        {"background", "white"}
+        {"image_y_flipped", false}
     };
-    manifest["full_color_volumes"] = output.summary.textured_volume_count;
-    manifest["textures"] = output.summary.total_textures;
-    manifest["loaded_textures"] = loaded_texture_count;
-    manifest["triangle_count"] = triangles.size();
-    manifest["grid_cells"] = triangle_grid.cells.size();
-    manifest["output_reason"] = output_reason;
+    manifest["full_color_data"] = {
+        {"volume_count", output.summary.volume_count},
+        {"textured_volume_count", output.summary.textured_volume_count},
+        {"triangle_count", triangles.size()},
+        {"triangle_count_mesh", triangle_count_mesh},
+        {"triangle_count_full_color_metadata", triangle_count_full_color_metadata},
+        {"texture_count", textures.size()},
+        {"loaded_texture_count", loaded_texture_count},
+        {"triangle_mapping_strategy", "mesh-triangle-index-to-full-color-triangle-index"},
+        {"triangle_mapping_validated", triangle_mapping_validated},
+        {"validated_full_color_volumes", validated_volume_count},
+        {"skipped_mapping_mismatch_volumes", skipped_mapping_mismatch_volume_count},
+        {"vertex_colors_present", vertex_colors_present},
+        {"face_colors_present", face_colors_present},
+        {"uv_triangles_present", uv_triangles_present}
+    };
+    manifest["debug"] = {
+        {"raster_debug_mode", raster_debug_mode_manifest_name(debug_mode)},
+        {"uv_debug_available", true},
+        {"triangle_debug_available", true},
+        {"debug_env_vars", {
+            {"ORCA_FULL_COLOR_RASTER_DEBUG", "none | uv | triangle"},
+            {"ORCA_FULL_COLOR_PREVIEW", "0 | 1"}
+        }},
+        {"warnings", json::array()}
+    };
+    manifest["implementation"] = {
+        {"raster_geometry_source", "PrintObject::trafo_centered() * ModelVolume::get_matrix() * ModelVolume::mesh().its"},
+        {"viewport_geometry_source", "ModelVolume::mesh().its with duplicated textured vertices, transformed by GLVolume world_matrix"},
+        {"coordinate_space", "slicer object space with PrintInstance::shift_without_plate_offset applied in XY"},
+        {"grid_cells", triangle_grid.cells.size()},
+        {"output_reason", output_reason}
+    };
+    manifest["overlay_preview"] = {
+        {"enabled_by_viewer_toggle", "Show full-color layers"},
+        {"rendering_method", "transparent-white textured quad in G-code preview"},
+        {"white_to_alpha_threshold", 250},
+        {"two_sided", true},
+        {"coordinate_space", "print-bed"},
+        {"z_offset_mm", 0.02},
+        {"layer_matching", "manifest layer_index matched to current G-code preview layer slider"}
+    };
     manifest["layers"] = json::array();
 
     for (const LayerRasterInfo &layer : layers) {
+        const auto layer_start = RasterClock::now();
+        LayerDebugCounters counters;
+        counters.total_pixels = static_cast<size_t>(width) * static_cast<size_t>(height);
         std::vector<std::uint8_t> image(static_cast<size_t>(width) * static_cast<size_t>(height) * 3, 255);
-        for (int y = 0; y < height; ++y) {
-            const double py = min_pt.y() + (y + 0.5) * FULL_COLOR_PIXEL_SIZE_MM;
-            for (int x = 0; x < width; ++x) {
-                const Vec3d query(
-                    min_pt.x() + (x + 0.5) * FULL_COLOR_PIXEL_SIZE_MM,
-                    py,
-                    layer.sample_z);
+        const LayerPixelBounds active_bounds = layer_pixel_bounds(triangles, min_pt, width, height, layer.sample_z, shell_thickness);
+        std::vector<LayerDebugCounters> row_counters(static_cast<size_t>(height));
 
-                RGBA color{1.0f, 1.0f, 1.0f, 1.0f};
-                if (sample_best_triangle(triangles, textures, triangle_grid, query, shell_thickness, color)) {
-                    const size_t idx = (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)) * 3;
-                    image[idx + 0] = to_u8(color[0]);
-                    image[idx + 1] = to_u8(color[1]);
-                    image[idx + 2] = to_u8(color[2]);
+        if (!active_bounds.empty()) {
+            tbb::parallel_for(
+                tbb::blocked_range<int>(active_bounds.min_y, active_bounds.max_y + 1, 8),
+                [&](const tbb::blocked_range<int> &range) {
+                    for (int y = range.begin(); y != range.end(); ++y) {
+                        LayerDebugCounters local;
+                        const double py = min_pt.y() + (y + 0.5) * FULL_COLOR_PIXEL_SIZE_MM;
+                        for (int x = active_bounds.min_x; x <= active_bounds.max_x; ++x) {
+                            const Vec3d query(
+                                min_pt.x() + (x + 0.5) * FULL_COLOR_PIXEL_SIZE_MM,
+                                py,
+                                layer.sample_z);
+
+                            RGBA color{1.0f, 1.0f, 1.0f, 1.0f};
+                            if (sample_pixel_color(triangles, textures, triangle_grid, query, shell_thickness, debug_mode, local, color)) {
+                                ++local.colored_pixels;
+                                const size_t idx = (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)) * 3;
+                                image[idx + 0] = to_u8(color[0]);
+                                image[idx + 1] = to_u8(color[1]);
+                                image[idx + 2] = to_u8(color[2]);
+                            }
+                        }
+                        row_counters[static_cast<size_t>(y)] = local;
+                    }
                 }
-            }
+            );
         }
+
+        for (const LayerDebugCounters &row_counter : row_counters) {
+            LayerDebugCounters row_no_total = row_counter;
+            row_no_total.total_pixels = 0;
+            add_counters(counters, row_no_total);
+        }
+        const double layer_ms = elapsed_ms(layer_start);
+        timing.layer_raster_total_ms += layer_ms;
+        timing.slowest_layer_ms = std::max(timing.slowest_layer_ms, layer_ms);
 
         const std::string base = layer_basename(layer.index);
         const boost::filesystem::path png_path = layer_dir / (base + ".png");
@@ -894,57 +1328,125 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
         png::write_rgb_to_file(png_path.string(), width, height, image);
 
         json layer_json;
-        layer_json["layer_index"] = layer.index;
-        layer_json["z0"] = layer.z0;
-        layer_json["z1"] = layer.z1;
-        layer_json["sample_z"] = layer.sample_z;
-        layer_json["shell_thickness_mm"] = shell_thickness;
-        layer_json["pixel_size_mm"] = FULL_COLOR_PIXEL_SIZE_MM;
-        layer_json["image_width"] = width;
-        layer_json["image_height"] = height;
-        layer_json["origin_xy_mm"] = {min_pt.x(), min_pt.y()};
-        layer_json["image_row_0_y_mm"] = min_pt.y();
-        layer_json["image_y_flipped"] = false;
-        layer_json["background"] = "white";
-        layer_json["units"] = "mm";
-        layer_json["coordinate_convention"] = "print-bed XY in mm; sample_z uses actual PrintObject layer slice_z";
-        layer_json["raster_strategy"] = "closest-triangle-uniform-grid";
-        layer_json["texture_sampling"] = "bilinear";
-        layer_json["uv_flip_v"] = FULL_COLOR_OBJ_FLIP_V;
-        layer_json["image"] = png_path.filename().string();
+        layer_json["format"] = "OrcaSlicerChromaLayer";
+        layer_json["version"] = 1;
+        layer_json["layer"] = {
+            {"layer_index", layer.index},
+            {"z0_mm", layer.z0},
+            {"z1_mm", layer.z1},
+            {"sample_z_mm", layer.sample_z},
+            {"source", "actual PrintObject layer slice_z/bottom_z/print_z"}
+        };
+        layer_json["image"] = {
+            {"file", (boost::filesystem::path("layers") / png_path.filename()).string()},
+            {"width_px", width},
+            {"height_px", height},
+            {"channels", "RGB"},
+            {"background", "white"},
+            {"pixel_size_mm", FULL_COLOR_PIXEL_SIZE_MM},
+            {"origin_xy_mm", {min_pt.x(), min_pt.y()}},
+            {"image_row_0_y_mm", min_pt.y()},
+            {"image_y_flipped", false},
+            {"coordinate_space", "print-bed"},
+            {"units", "mm"}
+        };
+        layer_json["config"] = {
+            {"enable_full_color_printing", true},
+            {"full_color_shell_thickness_mm", shell_thickness},
+            {"normal_tolerance_mm", FULL_COLOR_NORMAL_TOLERANCE_MM},
+            {"shell_mode", "normal-inward"},
+            {"raster_strategy", "vertical-layer-projection-with-closest-point-fallback-uniform-grid"},
+            {"texture_sampling", "bilinear"},
+            {"uv_flip_v", FULL_COLOR_OBJ_FLIP_V},
+            {"cpu_texture_v_flip", FULL_COLOR_CPU_TEXTURE_FLIP_V},
+            {"texture_address_mode", FULL_COLOR_TEXTURE_ADDRESS_MODE},
+            {"texture_buffer_origin", FULL_COLOR_TEXTURE_BUFFER_ORIGIN}
+        };
+        layer_json["debug"] = {
+            {"raster_debug_mode", raster_debug_mode_manifest_name(debug_mode)},
+            {"uv_debug_available", true},
+            {"triangle_debug_available", true},
+            {"total_pixels", counters.total_pixels},
+            {"colored_pixels", counters.colored_pixels},
+            {"candidate_misses", counters.candidate_misses},
+            {"candidate_triangle_tests", counters.candidate_triangle_tests},
+            {"accepted_triangle_hits", counters.accepted_triangle_hits},
+            {"subpixel_edge_hits", counters.subpixel_edge_hits},
+            {"active_bounds_empty", active_bounds.empty()},
+            {"active_bounds_px", active_bounds.empty() ? json(nullptr) : json{
+                {"min_x", active_bounds.min_x},
+                {"max_x", active_bounds.max_x},
+                {"min_y", active_bounds.min_y},
+                {"max_y", active_bounds.max_y}
+            }},
+            {"layer_raster_time_ms", layer_ms},
+            {"vertical_projected_samples", counters.vertical_projected_samples},
+            {"closest_point_samples", counters.closest_point_samples},
+            {"rejected_by_xy_projection", counters.rejected_by_xy_projection},
+            {"rejected_by_shell_distance", counters.rejected_by_shell_distance},
+            {"rejected_by_normal", counters.rejected_by_normal},
+            {"invalid_uv_texture", counters.invalid_uv_texture}
+        };
+        layer_json["full_color_data"] = {
+            {"triangle_count", triangles.size()},
+            {"texture_count", textures.size()},
+            {"loaded_texture_count", loaded_texture_count},
+            {"triangle_mapping_strategy", "mesh-triangle-index-to-full-color-triangle-index"},
+            {"triangle_mapping_validated", triangle_mapping_validated}
+        };
+        layer_json["bounds"] = {
+            {"min_mm", {min_pt.x(), min_pt.y(), min_pt.z()}},
+            {"max_mm", {max_pt.x(), max_pt.y(), max_pt.z()}}
+        };
+        layer_json["notes"] = json::array();
         write_json_file(json_path, layer_json);
 
         manifest["layers"].push_back({
             {"layer_index", layer.index},
-            {"z0", layer.z0},
-            {"z1", layer.z1},
-            {"sample_z", layer.sample_z},
+            {"z0_mm", layer.z0},
+            {"z1_mm", layer.z1},
+            {"sample_z_mm", layer.sample_z},
+            {"colored_pixels", counters.colored_pixels},
+            {"layer_raster_time_ms", layer_ms},
             {"png", (boost::filesystem::path("layers") / png_path.filename()).string()},
-            {"json", (boost::filesystem::path("layer_metadata") / json_path.filename()).string()}
+            {"metadata", (boost::filesystem::path("layer_metadata") / json_path.filename()).string()}
         });
     }
 
     const boost::filesystem::path manifest_path = staging_dir / "manifest.json";
-    manifest["layer_count"] = layers.size();
-    manifest["package"] = {
-        {"type", "chroma"},
-        {"container", "zip"},
-        {"output", chroma_path.string()},
-        {"gcode_filename", boost::filesystem::path(gcode_path).filename().string()},
-        {"layers_dir", "layers"},
-        {"layer_metadata_dir", "layer_metadata"}
+    timing.layer_average_ms = layers.empty() ? 0.0 : timing.layer_raster_total_ms / static_cast<double>(layers.size());
+    timing.total_ms = elapsed_ms(total_start);
+    manifest["timing"] = {
+        {"total_before_packaging_ms", timing.total_ms},
+        {"surface_triangle_preparation_ms", timing.surface_prep_ms},
+        {"grid_build_ms", timing.grid_build_ms},
+        {"layer_raster_total_ms", timing.layer_raster_total_ms},
+        {"layer_average_ms", timing.layer_average_ms},
+        {"slowest_layer_ms", timing.slowest_layer_ms},
+        {"staging_ms", timing.staging_ms},
+        {"manifest_write_ms", timing.manifest_ms},
+        {"packaging_time_ms", timing.packaging_ms},
+        {"packaging_time_note", "Actual package write time is logged after the ZIP is closed; it is not known while writing files inside the package."},
+        {"parallelization", "per-layer rows via tbb::parallel_for"}
     };
-    manifest["future_format_support_todo"] = {
-        "3MF texture/color support",
-        "glTF/GLB textured mesh support",
-        "PLY vertex colors",
-        "VRML/X3D if useful",
-        "OBJ+MTL+texture is the currently proven MVP path"
-    };
+
+    const auto manifest_start = RasterClock::now();
+    write_json_file(manifest_path, manifest);
+    timing.manifest_ms = elapsed_ms(manifest_start);
+    timing.total_ms = elapsed_ms(total_start);
+    manifest["timing"]["total_before_packaging_ms"] = timing.total_ms;
+    manifest["timing"]["manifest_write_ms"] = timing.manifest_ms;
     write_json_file(manifest_path, manifest);
 
+    write_debug_log(staging_dir / "debug_log.txt", output_reason, debug_mode, triangles.size(),
+                    triangle_count_mesh, triangle_count_full_color_metadata, triangle_mapping_validated,
+                    triangle_grid.cells.size(), textures.size(), loaded_texture_count, layers.size(),
+                    min_pt, max_pt, width, height, shell_thickness, timing);
+
     std::string zip_error;
+    const auto packaging_start = RasterClock::now();
     const bool zip_ok = write_stored_zip_from_directory(staging_dir, chroma_path, zip_error);
+    timing.packaging_ms = elapsed_ms(packaging_start);
     if (!zip_ok) {
         BOOST_LOG_TRIVIAL(error) << "FullColor Raster: failed to write .chroma package: " << zip_error;
         output.output_dir = staging_dir.string();
@@ -955,6 +1457,15 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
     }
 
     BOOST_LOG_TRIVIAL(info) << "FullColor Raster: chroma package written=" << chroma_path.string();
+    BOOST_LOG_TRIVIAL(info) << "FullColor Raster: timings total_before_packaging_ms=" << timing.total_ms
+                            << ", surface_prep_ms=" << timing.surface_prep_ms
+                            << ", grid_build_ms=" << timing.grid_build_ms
+                            << ", layer_raster_total_ms=" << timing.layer_raster_total_ms
+                            << ", layer_average_ms=" << timing.layer_average_ms
+                            << ", slowest_layer_ms=" << timing.slowest_layer_ms
+                            << ", staging_ms=" << timing.staging_ms
+                            << ", manifest_write_ms=" << timing.manifest_ms
+                            << ", packaging_ms=" << timing.packaging_ms;
 
     try {
         boost::filesystem::remove_all(staging_dir);

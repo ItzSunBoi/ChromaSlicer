@@ -495,8 +495,12 @@ return true;
 
 void ModelObjectsInfo::on_update()
 {
-    if (!get_pool()->get_canvas()->get_model()->objects.empty()) {
-        m_model_objects = get_pool()->get_canvas()->get_model()->objects;
+    AssembleViewDataPool* pool = get_pool();
+    GLCanvas3D* canvas = pool != nullptr ? pool->get_canvas() : nullptr;
+    const Model* model = canvas != nullptr ? canvas->get_model() : nullptr;
+
+    if (model != nullptr && !model->objects.empty()) {
+        m_model_objects = model->objects;
     }
     else {
         m_model_objects.clear();

@@ -22,33 +22,157 @@
 #include "GLCanvas3D.hpp"
 #include "FilamentGroupPopup.hpp"
 #include "GLToolbar.hpp"
+#include "OpenGLManager.hpp"
 #include "GUI_Preview.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/Layer.hpp"
 #include "Widgets/ProgressDialog.hpp"
 #include "MsgDialog.hpp"
+#include "GLTexture.hpp"
 
 #define IMGUI_DEFINE_MATH_OPERATORS
 
 #include <imgui/imgui_internal.h>
 
 #include <glad/gl.h>
+#include <miniz.h>
 #include <boost/log/trivial.hpp>
 #include <boost/algorithm/string/split.hpp>
+#include <boost/filesystem.hpp>
 #include <boost/nowide/cstdio.hpp>
 #include <boost/nowide/fstream.hpp>
 #include <wx/progdlg.h>
 #include <wx/numformatter.h>
 #include <wx/utils.h>
+#include <wx/image.h>
+#include "nlohmann/json.hpp"
 
 #include <array>
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <cstdlib>
+#include <iterator>
+#include <map>
+#include <optional>
+#include <sstream>
 
 
 namespace Slic3r {
 namespace GUI {
+
+namespace {
+
+using json = nlohmann::json;
+
+static constexpr unsigned char FULL_COLOR_OVERLAY_WHITE_TO_ALPHA_THRESHOLD = 250;
+static constexpr double        FULL_COLOR_OVERLAY_Z_OFFSET_MM             = 0.02;
+
+static bool read_text_file(const boost::filesystem::path &path, std::string &out)
+{
+    boost::nowide::ifstream in(path.string());
+    if (!in)
+        return false;
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    out = ss.str();
+    return true;
+}
+
+static bool read_zip_entry(const boost::filesystem::path &zip_path, const std::string &entry, std::vector<unsigned char> &out)
+{
+    mz_zip_archive archive {};
+    if (!mz_zip_reader_init_file(&archive, zip_path.string().c_str(), 0))
+        return false;
+
+    bool ok = false;
+    mz_zip_archive_file_stat stat {};
+    const int index = mz_zip_reader_locate_file(&archive, entry.c_str(), nullptr, 0);
+    if (index >= 0 && mz_zip_reader_file_stat(&archive, static_cast<mz_uint>(index), &stat)) {
+        out.assign(static_cast<size_t>(stat.m_uncomp_size), 0);
+        ok = out.empty() || mz_zip_reader_extract_to_mem(&archive, static_cast<mz_uint>(index), out.data(), out.size(), 0);
+    }
+
+    mz_zip_reader_end(&archive);
+    return ok;
+}
+
+static bool read_zip_entry_text(const boost::filesystem::path &zip_path, const std::string &entry, std::string &out)
+{
+    std::vector<unsigned char> bytes;
+    if (!read_zip_entry(zip_path, entry, bytes))
+        return false;
+    out.assign(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    return true;
+}
+
+class GLStateScope
+{
+    GLenum    m_active_texture = GL_TEXTURE0;
+    GLint     m_program = 0;
+    GLint     m_texture = 0;
+    GLint     m_array_buffer = 0;
+    GLint     m_element_array_buffer = 0;
+    GLint     m_vertex_array = 0;
+    GLboolean m_blend = GL_FALSE;
+    GLboolean m_cull_face = GL_FALSE;
+    GLboolean m_depth_test = GL_FALSE;
+    GLboolean m_stencil_test = GL_FALSE;
+    GLenum    m_blend_src_rgb = GL_ONE;
+    GLenum    m_blend_dst_rgb = GL_ZERO;
+    GLenum    m_blend_src_alpha = GL_ONE;
+    GLenum    m_blend_dst_alpha = GL_ZERO;
+    GLenum    m_blend_equation_rgb = GL_FUNC_ADD;
+    GLenum    m_blend_equation_alpha = GL_FUNC_ADD;
+    GLboolean m_depth_mask = GL_TRUE;
+
+public:
+    GLStateScope()
+    {
+        glsafe(::glGetIntegerv(GL_ACTIVE_TEXTURE, reinterpret_cast<GLint*>(&m_active_texture)));
+        glsafe(::glGetIntegerv(GL_CURRENT_PROGRAM, &m_program));
+        glsafe(::glGetIntegerv(GL_TEXTURE_BINDING_2D, &m_texture));
+        glsafe(::glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &m_array_buffer));
+        glsafe(::glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &m_element_array_buffer));
+#if !SLIC3R_OPENGL_ES
+        if (OpenGLManager::get_gl_info().is_core_profile())
+#endif
+            glsafe(::glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &m_vertex_array));
+        m_blend       = ::glIsEnabled(GL_BLEND);
+        m_cull_face   = ::glIsEnabled(GL_CULL_FACE);
+        m_depth_test  = ::glIsEnabled(GL_DEPTH_TEST);
+        m_stencil_test = ::glIsEnabled(GL_STENCIL_TEST);
+        glsafe(::glGetIntegerv(GL_BLEND_SRC_RGB, reinterpret_cast<GLint*>(&m_blend_src_rgb)));
+        glsafe(::glGetIntegerv(GL_BLEND_DST_RGB, reinterpret_cast<GLint*>(&m_blend_dst_rgb)));
+        glsafe(::glGetIntegerv(GL_BLEND_SRC_ALPHA, reinterpret_cast<GLint*>(&m_blend_src_alpha)));
+        glsafe(::glGetIntegerv(GL_BLEND_DST_ALPHA, reinterpret_cast<GLint*>(&m_blend_dst_alpha)));
+        glsafe(::glGetIntegerv(GL_BLEND_EQUATION_RGB, reinterpret_cast<GLint*>(&m_blend_equation_rgb)));
+        glsafe(::glGetIntegerv(GL_BLEND_EQUATION_ALPHA, reinterpret_cast<GLint*>(&m_blend_equation_alpha)));
+        glsafe(::glGetBooleanv(GL_DEPTH_WRITEMASK, &m_depth_mask));
+    }
+
+    ~GLStateScope()
+    {
+        glsafe(::glUseProgram(static_cast<GLuint>(m_program)));
+        glsafe(::glActiveTexture(m_active_texture));
+        glsafe(::glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(m_texture)));
+        glsafe(::glBindBuffer(GL_ARRAY_BUFFER, static_cast<GLuint>(m_array_buffer)));
+        glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLuint>(m_element_array_buffer)));
+#if !SLIC3R_OPENGL_ES
+        if (OpenGLManager::get_gl_info().is_core_profile())
+#endif
+            glsafe(::glBindVertexArray(static_cast<GLuint>(m_vertex_array)));
+        glsafe(::glBlendEquationSeparate(m_blend_equation_rgb, m_blend_equation_alpha));
+        glsafe(::glBlendFuncSeparate(m_blend_src_rgb, m_blend_dst_rgb, m_blend_src_alpha, m_blend_dst_alpha));
+        if (m_blend) glsafe(::glEnable(GL_BLEND)); else glsafe(::glDisable(GL_BLEND));
+        if (m_cull_face) glsafe(::glEnable(GL_CULL_FACE)); else glsafe(::glDisable(GL_CULL_FACE));
+        if (m_depth_test) glsafe(::glEnable(GL_DEPTH_TEST)); else glsafe(::glDisable(GL_DEPTH_TEST));
+        if (m_stencil_test) glsafe(::glEnable(GL_STENCIL_TEST)); else glsafe(::glDisable(GL_STENCIL_TEST));
+        glsafe(::glDepthMask(m_depth_mask));
+    }
+};
+
+} // namespace
 
 //BBS translation of EViewType
 //const std::string EViewType_Map[(int) GCodeViewer::EViewType::Count] = {
@@ -991,6 +1115,386 @@ GCodeViewer::~GCodeViewer()
     }
 }
 
+struct GCodeViewer::FullColorLayerOverlay
+{
+    struct LayerInfo
+    {
+        size_t index = 0;
+        double z0 = 0.0;
+        double z1 = 0.0;
+        double sample_z = 0.0;
+        int width_px = 0;
+        int height_px = 0;
+        double pixel_size_mm = 0.0;
+        Vec2d origin_xy = Vec2d::Zero();
+        bool image_y_flipped = false;
+        std::string png_path;
+        std::string metadata_path;
+    };
+
+    struct LayerTexture
+    {
+        GLTexture texture;
+        GLModel quad;
+        bool valid = false;
+    };
+
+    bool package_available = false;
+    bool from_zip = false;
+    boost::filesystem::path source_path;
+    boost::filesystem::path temp_dir;
+    std::vector<LayerInfo> layers;
+    std::map<size_t, LayerTexture> cache;
+
+    ~FullColorLayerOverlay()
+    {
+        clear();
+    }
+
+    void clear()
+    {
+        cache.clear();
+        layers.clear();
+        package_available = false;
+        from_zip = false;
+        source_path.clear();
+        if (!temp_dir.empty()) {
+            boost::system::error_code ec;
+            boost::filesystem::remove_all(temp_dir, ec);
+            temp_dir.clear();
+        }
+    }
+
+    bool reset_for_gcode(const std::string &gcode_path)
+    {
+        clear();
+
+        BOOST_LOG_TRIVIAL(info) << "FullColor Preview Overlay: reset for gcode=" << gcode_path;
+
+        const std::optional<boost::filesystem::path> candidate = find_manifest_or_chroma(gcode_path);
+        if (!candidate) {
+            BOOST_LOG_TRIVIAL(info) << "FullColor Preview Overlay: no Chroma package found for gcode=" << gcode_path;
+            return false;
+        }
+
+        bool loaded = false;
+        if (boost::filesystem::is_directory(*candidate))
+            loaded = load_from_directory(*candidate / "manifest.json");
+        else if (candidate->extension() == ".json")
+            loaded = load_from_directory(*candidate);
+        else
+            loaded = load_from_chroma(*candidate);
+
+        if (loaded) {
+            BOOST_LOG_TRIVIAL(info) << "FullColor Preview Overlay: loaded package=" << source_path.string()
+                                    << ", layers=" << layers.size()
+                                    << ", source=" << (from_zip ? ".chroma" : "unpacked");
+        } else {
+            BOOST_LOG_TRIVIAL(warning) << "FullColor Preview Overlay: failed to load package=" << candidate->string();
+        }
+        return loaded;
+    }
+
+    std::optional<boost::filesystem::path> find_manifest_or_chroma(const std::string &gcode_path) const
+    {
+        if (const char *env_manifest = std::getenv("ORCA_FULL_COLOR_OVERLAY_MANIFEST")) {
+            boost::filesystem::path path(env_manifest);
+            if (boost::filesystem::exists(path))
+                return path;
+        }
+
+        if (const char *env_chroma = std::getenv("ORCA_FULL_COLOR_OVERLAY_CHROMA")) {
+            boost::filesystem::path path(env_chroma);
+            if (boost::filesystem::exists(path))
+                return path;
+        }
+
+        if (!gcode_path.empty()) {
+            const boost::filesystem::path gcode(gcode_path);
+            const boost::filesystem::path chroma = gcode.parent_path() / (gcode.stem().string() + ".chroma");
+            BOOST_LOG_TRIVIAL(info) << "FullColor Preview Overlay: probing Chroma package=" << chroma.string();
+            if (boost::filesystem::exists(chroma))
+                return chroma;
+
+            const boost::filesystem::path manifest = gcode.parent_path() / "manifest.json";
+            BOOST_LOG_TRIVIAL(info) << "FullColor Preview Overlay: probing unpacked manifest=" << manifest.string();
+            if (boost::filesystem::exists(manifest))
+                return manifest;
+        }
+
+        return std::nullopt;
+    }
+
+    bool load_manifest_json(const std::string &manifest_text, json &manifest)
+    {
+        try {
+            manifest = json::parse(manifest_text);
+        } catch (const std::exception &e) {
+            BOOST_LOG_TRIVIAL(warning) << "FullColor Preview Overlay: failed to parse manifest: " << e.what();
+            return false;
+        }
+
+        if (!manifest.is_object() || manifest.value("format", std::string()) != "OrcaSlicerChroma") {
+            BOOST_LOG_TRIVIAL(warning) << "FullColor Preview Overlay: manifest is not OrcaSlicerChroma";
+            return false;
+        }
+        return true;
+    }
+
+    bool load_from_directory(const boost::filesystem::path &manifest_path)
+    {
+        std::string manifest_text;
+        if (!read_text_file(manifest_path, manifest_text))
+            return false;
+
+        json manifest;
+        if (!load_manifest_json(manifest_text, manifest))
+            return false;
+
+        from_zip = false;
+        source_path = manifest_path.parent_path();
+        return load_layers(manifest, [this](const std::string &entry, std::string &out) {
+            return read_text_file(source_path / entry, out);
+        });
+    }
+
+    bool load_from_chroma(const boost::filesystem::path &chroma_path)
+    {
+        std::string manifest_text;
+        if (!read_zip_entry_text(chroma_path, "manifest.json", manifest_text))
+            return false;
+
+        json manifest;
+        if (!load_manifest_json(manifest_text, manifest))
+            return false;
+
+        from_zip = true;
+        source_path = chroma_path;
+        temp_dir = boost::filesystem::temp_directory_path() / boost::filesystem::unique_path("orcaslicer_chroma_overlay_%%%%-%%%%-%%%%");
+        boost::system::error_code ec;
+        boost::filesystem::create_directories(temp_dir, ec);
+        return load_layers(manifest, [this](const std::string &entry, std::string &out) {
+            return read_zip_entry_text(source_path, entry, out);
+        });
+    }
+
+    template <class MetadataReader>
+    bool load_layers(const json &manifest, MetadataReader read_metadata)
+    {
+        layers.clear();
+        if (!manifest.contains("layers") || !manifest["layers"].is_array())
+            return false;
+
+        for (const json &entry : manifest["layers"]) {
+            if (!entry.is_object())
+                continue;
+
+            const std::string metadata_path = entry.value("metadata", std::string());
+            const std::string png_path = entry.value("png", std::string());
+            if (metadata_path.empty() || png_path.empty())
+                continue;
+
+            std::string metadata_text;
+            if (!read_metadata(metadata_path, metadata_text))
+                continue;
+
+            json metadata;
+            try {
+                metadata = json::parse(metadata_text);
+            } catch (...) {
+                continue;
+            }
+
+            LayerInfo layer;
+            layer.index = entry.value("layer_index", metadata.value("layer_index", 0));
+            if (metadata.contains("layer") && metadata["layer"].is_object()) {
+                const json &layer_json = metadata["layer"];
+                layer.index = layer_json.value("layer_index", layer.index);
+                layer.z0 = layer_json.value("z0_mm", layer_json.value("z0", 0.0));
+                layer.z1 = layer_json.value("z1_mm", layer_json.value("z1", 0.0));
+                layer.sample_z = layer_json.value("sample_z_mm", layer_json.value("sample_z", layer.z1));
+            } else {
+                layer.z0 = metadata.value("z0", 0.0);
+                layer.z1 = metadata.value("z1", 0.0);
+                layer.sample_z = metadata.value("sample_z", layer.z1);
+            }
+
+            const json image = metadata.value("image", json::object());
+            layer.width_px = image.value("width_px", metadata.value("image_width", 0));
+            layer.height_px = image.value("height_px", metadata.value("image_height", 0));
+            layer.pixel_size_mm = image.value("pixel_size_mm", metadata.value("pixel_size_mm", 0.0));
+            layer.image_y_flipped = image.value("image_y_flipped", metadata.value("image_y_flipped", false));
+            if (image.contains("origin_xy_mm") && image["origin_xy_mm"].is_array() && image["origin_xy_mm"].size() >= 2) {
+                layer.origin_xy = Vec2d(image["origin_xy_mm"][0].get<double>(), image["origin_xy_mm"][1].get<double>());
+            } else if (metadata.contains("origin_xy_mm") && metadata["origin_xy_mm"].is_array() && metadata["origin_xy_mm"].size() >= 2) {
+                layer.origin_xy = Vec2d(metadata["origin_xy_mm"][0].get<double>(), metadata["origin_xy_mm"][1].get<double>());
+            }
+            layer.png_path = png_path;
+            layer.metadata_path = metadata_path;
+
+            if (layer.width_px > 0 && layer.height_px > 0 && layer.pixel_size_mm > 0.0)
+                layers.push_back(layer);
+        }
+
+        package_available = !layers.empty();
+        return package_available;
+    }
+
+    const LayerInfo *find_layer(size_t layer_index) const
+    {
+        auto it = std::find_if(layers.begin(), layers.end(), [layer_index](const LayerInfo &layer) {
+            return layer.index == layer_index;
+        });
+        if (it != layers.end())
+            return &*it;
+        return layer_index < layers.size() ? &layers[layer_index] : nullptr;
+    }
+
+    bool read_png_bytes(const LayerInfo &layer, std::vector<unsigned char> &bytes)
+    {
+        if (from_zip)
+            return read_zip_entry(source_path, layer.png_path, bytes);
+
+        const boost::filesystem::path png = source_path / layer.png_path;
+        boost::nowide::ifstream in(png.string(), std::ios::binary);
+        if (!in)
+            return false;
+        bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        return true;
+    }
+
+    bool layer_png_to_temp_file(const LayerInfo &layer, boost::filesystem::path &out_path)
+    {
+        if (!from_zip) {
+            out_path = source_path / layer.png_path;
+            return boost::filesystem::exists(out_path);
+        }
+
+        std::vector<unsigned char> bytes;
+        if (!read_png_bytes(layer, bytes))
+            return false;
+
+        out_path = temp_dir / ("L" + std::to_string(layer.index) + ".png");
+        boost::nowide::ofstream out(out_path.string(), std::ios::binary);
+        if (!out)
+            return false;
+        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        return static_cast<bool>(out);
+    }
+
+    LayerTexture *texture_for_layer(const LayerInfo &layer)
+    {
+        auto cached = cache.find(layer.index);
+        if (cached != cache.end())
+            return cached->second.valid ? &cached->second : nullptr;
+
+        LayerTexture &texture = cache[layer.index];
+
+        boost::filesystem::path png_path;
+        if (!layer_png_to_temp_file(layer, png_path))
+            return nullptr;
+
+        wxImage image;
+        if (!image.LoadFile(wxString::FromUTF8(png_path.string())))
+            return nullptr;
+
+        if (!image.HasAlpha())
+            image.InitAlpha();
+
+        const int width = image.GetWidth();
+        const int height = image.GetHeight();
+        if (width <= 0 || height <= 0)
+            return nullptr;
+
+        const unsigned char *rgb = image.GetData();
+        unsigned char *alpha = image.GetAlpha();
+        std::vector<unsigned char> rgba(static_cast<size_t>(width) * static_cast<size_t>(height) * 4, 0);
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                const size_t src = static_cast<size_t>(y * width + x);
+                const size_t dst = src * 4;
+                const unsigned char r = rgb[src * 3 + 0];
+                const unsigned char g = rgb[src * 3 + 1];
+                const unsigned char b = rgb[src * 3 + 2];
+                const bool white = r >= FULL_COLOR_OVERLAY_WHITE_TO_ALPHA_THRESHOLD &&
+                                   g >= FULL_COLOR_OVERLAY_WHITE_TO_ALPHA_THRESHOLD &&
+                                   b >= FULL_COLOR_OVERLAY_WHITE_TO_ALPHA_THRESHOLD;
+                rgba[dst + 0] = r;
+                rgba[dst + 1] = g;
+                rgba[dst + 2] = b;
+                rgba[dst + 3] = white ? 0 : (alpha != nullptr ? alpha[src] : 255);
+            }
+        }
+
+        if (!texture.texture.load_from_raw_data(std::move(rgba), static_cast<unsigned int>(width), static_cast<unsigned int>(height), false))
+            return nullptr;
+
+        GLModel::Geometry geometry;
+        geometry.format = {GLModel::Geometry::EPrimitiveType::Triangles, GLModel::Geometry::EVertexLayout::P3T2};
+        geometry.reserve_vertices(4);
+        geometry.reserve_indices(12);
+
+        const double x0 = layer.origin_xy.x();
+        const double y0 = layer.origin_xy.y();
+        const double x1 = x0 + static_cast<double>(width) * layer.pixel_size_mm;
+        const double y1 = y0 + static_cast<double>(height) * layer.pixel_size_mm;
+        const float z = static_cast<float>(layer.sample_z + FULL_COLOR_OVERLAY_Z_OFFSET_MM);
+        const float v_bottom = layer.image_y_flipped ? 1.0f : 0.0f;
+        const float v_top = layer.image_y_flipped ? 0.0f : 1.0f;
+
+        geometry.add_vertex(Vec3f(static_cast<float>(x0), static_cast<float>(y0), z), Vec2f(0.0f, v_bottom));
+        geometry.add_vertex(Vec3f(static_cast<float>(x1), static_cast<float>(y0), z), Vec2f(1.0f, v_bottom));
+        geometry.add_vertex(Vec3f(static_cast<float>(x1), static_cast<float>(y1), z), Vec2f(1.0f, v_top));
+        geometry.add_vertex(Vec3f(static_cast<float>(x0), static_cast<float>(y1), z), Vec2f(0.0f, v_top));
+        geometry.add_triangle(0, 1, 2);
+        geometry.add_triangle(2, 3, 0);
+        geometry.add_triangle(2, 1, 0);
+        geometry.add_triangle(0, 3, 2);
+        texture.quad.init_from(std::move(geometry));
+        texture.valid = true;
+        return &texture;
+    }
+
+    void render(size_t layer_index)
+    {
+        if (!package_available)
+            return;
+
+        const LayerInfo *layer = find_layer(layer_index);
+        if (layer == nullptr)
+            return;
+
+        LayerTexture *texture = texture_for_layer(*layer);
+        if (texture == nullptr || !texture->valid)
+            return;
+
+        GLShaderProgram *shader = wxGetApp().get_shader("flat_texture");
+        if (shader == nullptr)
+            return;
+
+        GLStateScope state_scope;
+        const Camera &camera = wxGetApp().plater()->get_camera();
+
+        glsafe(::glActiveTexture(GL_TEXTURE0));
+        glsafe(::glBindTexture(GL_TEXTURE_2D, texture->texture.get_id()));
+        glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR));
+        glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR));
+        glsafe(::glEnable(GL_BLEND));
+        glsafe(::glBlendEquation(GL_FUNC_ADD));
+        glsafe(::glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA));
+        glsafe(::glDisable(GL_CULL_FACE));
+        glsafe(::glEnable(GL_DEPTH_TEST));
+        glsafe(::glDepthMask(GL_FALSE));
+
+        shader->start_using();
+        shader->set_uniform("uniform_texture", 0);
+        shader->set_uniform("view_model_matrix", camera.get_view_matrix());
+        shader->set_uniform("projection_matrix", camera.get_projection_matrix());
+        texture->quad.render(shader);
+        shader->stop_using();
+    }
+};
+
 void GCodeViewer::init(ConfigOptionMode mode, PresetBundle* preset_bundle)
 {
     if (m_gl_data_initialized)
@@ -1331,6 +1835,9 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
         }
     }
     m_only_gcode_in_preview = only_gcode;
+    if (!m_full_color_layer_overlay)
+        m_full_color_layer_overlay = std::make_unique<FullColorLayerOverlay>();
+    m_full_color_layer_overlay->reset_for_gcode(gcode_result.filename);
 
     m_sequential_view.gcode_window.load_gcode(gcode_result.filename, gcode_result.lines_ends);
 
@@ -1550,6 +2057,9 @@ void GCodeViewer::reset()
     //BBS: should also reset the result id
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": current result id %1% ")%m_last_result_id;
     m_last_result_id = -1;
+    if (m_full_color_layer_overlay)
+        m_full_color_layer_overlay->clear();
+    m_show_full_color_layers = false;
     //BBS: add only gcode mode
     m_only_gcode_in_preview = false;
 
@@ -1584,6 +2094,7 @@ void GCodeViewer::render(int canvas_width, int canvas_height, int right_margin)
         return;
 
     render_toolpaths();
+    render_full_color_layer_overlay();
 
     float legend_height = 0.0f;
     render_legend(legend_height, canvas_width, canvas_height, right_margin);
@@ -2475,6 +2986,15 @@ void GCodeViewer::render_toolpaths()
         imgui.end();
     }
 #endif // ENABLE_NEW_GCODE_VIEWER_DEBUG
+}
+
+void GCodeViewer::render_full_color_layer_overlay()
+{
+    if (!m_show_full_color_layers || !m_full_color_layer_overlay || !m_full_color_layer_overlay->package_available || m_layers_slider == nullptr)
+        return;
+
+    const int layer_idx = std::max(0, m_layers_slider->GetHigherValue());
+    m_full_color_layer_overlay->render(static_cast<size_t>(layer_idx));
 }
 
 void GCodeViewer::render_shells(int canvas_width, int canvas_height)
@@ -4681,6 +5201,22 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
     if (m_nozzle_nums > 1 && (m_viewer.get_view_type() == libvgcode::EViewType::Summary || m_viewer.get_view_type() == libvgcode::EViewType::ColorPrint)) // ORCA show only on summary and filament tab
         render_legend_color_arr_recommen(window_padding);
 
+    const bool full_color_overlay_available = m_full_color_layer_overlay && m_full_color_layer_overlay->package_available;
+    ImGui::Spacing();
+    ImGui::Dummy({ window_padding, window_padding });
+    ImGui::SameLine();
+    bool requested_full_color_layers = m_show_full_color_layers && full_color_overlay_available;
+    if (ImGui::Checkbox(_u8L("Show full-color layers").c_str(), &requested_full_color_layers)) {
+        m_show_full_color_layers = requested_full_color_layers && full_color_overlay_available;
+        wxGetApp().plater()->get_current_canvas3D()->set_as_dirty();
+        wxGetApp().plater()->get_current_canvas3D()->request_extra_frame();
+    }
+    if (!full_color_overlay_available) {
+        m_show_full_color_layers = false;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", _u8L("No .chroma layer raster package found for this preview.").c_str());
+    }
+
     legend_height = ImGui::GetCurrentWindow()->Size.y;
     imgui.end();
     ImGui::PopStyleColor(7);
@@ -4714,4 +5250,3 @@ void GCodeViewer::render_slider(int canvas_width, int canvas_height) {
 
 } // namespace GUI
 } // namespace Slic3r
-

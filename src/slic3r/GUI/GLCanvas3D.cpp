@@ -1154,8 +1154,15 @@ int GLCanvas3D::GetHoverId()
 
 }
 
-PrinterTechnology GLCanvas3D::current_printer_technology() const {
-    return m_process->current_printer_technology();
+PrinterTechnology GLCanvas3D::current_printer_technology() const
+{
+    // This may be called during early macOS startup before m_process is safely
+    // attached to the canvas. Avoid dereferencing m_process here; crash reports
+    // show it may be invalid/stale, not only nullptr.
+    if (wxGetApp().preset_bundle != nullptr)
+        return wxGetApp().preset_bundle->printers.get_edited_preset().printer_technology();
+
+    return ptFFF;
 }
 
 GLCanvas3D::GLCanvas3D(wxGLCanvas* canvas, Bed3D &bed)
@@ -1390,9 +1397,12 @@ void GLCanvas3D::reset_volumes()
 BoundingBoxf3 GLCanvas3D::_get_current_partplate_print_volume()
 {
     BoundingBoxf3 test_volume;
-    if (m_process && m_config)
-    {
-        BoundingBoxf3 plate_bb = m_process->get_current_plate()->get_bounding_box(false);
+    if (m_config != nullptr && wxGetApp().plater() != nullptr) {
+        PartPlate* current_plate = wxGetApp().plater()->get_partplate_list().get_curr_plate();
+        if (current_plate == nullptr)
+            return test_volume;
+
+        BoundingBoxf3 plate_bb = current_plate->get_bounding_box(false);
         BoundingBoxf3 print_volume({ plate_bb.min(0), plate_bb.min(1), 0.0 }, { plate_bb.max(0), plate_bb.max(1), m_config->opt_float("printable_height") });
         // Allow the objects to protrude below the print bed
         print_volume.min(2) = -1e10;
@@ -1402,8 +1412,6 @@ BoundingBoxf3 GLCanvas3D::_get_current_partplate_print_volume()
         print_volume.max(1) += Slic3r::BuildVolume::BedEpsilon;
         test_volume = print_volume;
     }
-    else
-        test_volume = BoundingBoxf3();
 
     return test_volume;
 }
@@ -1674,13 +1682,19 @@ void GLCanvas3D::update_instance_printable_state_for_objects(const std::vector<s
 
 void GLCanvas3D::set_config(const DynamicPrintConfig* config)
 {
+    if (config == nullptr) {
+        BOOST_LOG_TRIVIAL(warning)
+            << "GLCanvas3D::set_config skipped because config is null";
+        return;
+    }
+
     m_config = config;
     m_layers_editing.set_config(config);
 
-    // Orca: Filament shrinkage compensation
-    const Print *print = fff_print();
-    if (print != nullptr)
-        m_layers_editing.set_shrinkage_compensation(fff_print()->shrinkage_compensation());
+    // During startup this may be called before the canvas has a valid
+    // BackgroundSlicingProcess. Avoid dereferencing m_process through
+    // fff_print(); layer editing can stay neutral until a live print exists.
+    m_layers_editing.set_shrinkage_compensation(Vec3d::Ones());
 }
 
 void GLCanvas3D::set_model(Model* model)
@@ -2517,7 +2531,7 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
         return;
     }
 
-    PrinterTechnology printer_technology = current_printer_technology();
+    const PrinterTechnology printer_technology = current_printer_technology();
 
     // BBS: support wipe tower for multi-plates
     PartPlateList& ppl = wxGetApp().plater()->get_partplate_list();
@@ -2885,12 +2899,13 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
                 float v = dynamic_cast<const ConfigOptionFloat*>(m_config->option("prime_volume"))->value;
                 Vec3d plate_origin = ppl.get_plate(plate_id)->get_origin();
 
-                const Print* print = m_process->fff_print();
                 const Print* current_print = part_plate->fff_print();
+                if (current_print == nullptr)
+                    continue;
                 if (!need_wipe_tower && part_plate->get_extruders(true).size() < 2) continue;
                 if (part_plate->get_objects_on_this_plate().empty()) continue;
 
-                float brim_width = print->wipe_tower_data(filaments_count).brim_width;
+                float brim_width = current_print->wipe_tower_data(filaments_count).brim_width;
                 const DynamicPrintConfig &print_cfg   = wxGetApp().preset_bundle->prints.get_edited_preset().config;
                 int nozzle_nums = wxGetApp().preset_bundle->get_printer_extruder_count();
                 Vec3d wipe_tower_size = ppl.get_plate(plate_id)->estimate_wipe_tower_size(print_cfg, w, v, nozzle_nums, 0, false, dynamic_cast<const ConfigOptionBool*>(dconfig.option("enable_wrapping_detection"))->value);
@@ -5807,7 +5822,13 @@ bool GLCanvas3D::_render_orient_menu(float left, float right, float bottom, floa
     OrientSettings& settings_out = get_orient_settings();
 
     auto& appcfg = wxGetApp().app_config;
-    PrinterTechnology ptech = current_printer_technology();
+    PrinterTechnology printer_technology = ptFFF;
+
+    if (wxGetApp().preset_bundle != nullptr) {
+        const auto& printer_preset = wxGetApp().preset_bundle->printers.get_edited_preset();
+        if (printer_preset.printer_technology() == ptSLA)
+            printer_technology = ptSLA;
+    }
 
     bool settings_changed = false;
     float angle_min = 45.f;
@@ -5815,7 +5836,7 @@ bool GLCanvas3D::_render_orient_menu(float left, float right, float bottom, floa
     std::string key_min_area = "min_area";
     std::string postfix = "_fff";
 
-    if (ptech == ptSLA) {
+    if (printer_technology == ptSLA) {
         angle_min = 45.f;
         postfix = "_sla";
     }
@@ -7131,7 +7152,16 @@ BoundingBoxf3 GLCanvas3D::_max_bounding_box(bool include_gizmos, bool include_be
             bb.merge(m_gcode_viewer.get_shell_bounding_box());
     }
 
-    if ((m_canvas_type == CanvasView3D) && (fff_print()->config().print_sequence == PrintSequence::ByObject)) {
+    bool is_by_object = false;
+    if (m_config != nullptr) {
+        if (const auto* print_sequence =
+                m_config->option<ConfigOptionEnum<PrintSequence>>("print_sequence");
+            print_sequence != nullptr) {
+            is_by_object = print_sequence->value == PrintSequence::ByObject;
+        }
+    }
+
+    if ((m_canvas_type == CanvasView3D) && is_by_object) {
         float height_to_lid, height_to_rod;
         wxGetApp().plater()->get_partplate_list().get_height_limits(height_to_lid, height_to_rod);
         bb.max.z() = std::max(bb.max.z(), (double)height_to_lid);
@@ -8415,10 +8445,13 @@ void GLCanvas3D::_render_overlays()
     if (m_layers_editing.last_object_id >= 0 && m_layers_editing.object_max_z() > 0.0f)
         m_layers_editing.render_overlay(*this);
 
-	auto curr_plate = wxGetApp().plater()->get_partplate_list().get_curr_plate();
-    auto curr_print_seq = curr_plate->get_real_print_seq();
-    const Print* print = fff_print();
-    bool sequential_print = (curr_print_seq == PrintSequence::ByObject) || print->config().print_order == PrintOrder::AsObjectList;
+	PartPlate* curr_plate = wxGetApp().plater()->get_partplate_list().get_curr_plate();
+    const PrintSequence curr_print_seq = curr_plate != nullptr ? curr_plate->get_real_print_seq() : PrintSequence::ByLayer;
+    const Print* print = curr_plate != nullptr ? curr_plate->fff_print() : nullptr;
+    const bool sequential_print =
+        print != nullptr &&
+        ((curr_print_seq == PrintSequence::ByObject) ||
+         print->config().print_order == PrintOrder::AsObjectList);
     std::vector<const ModelInstance*> sorted_instances;
     if (sequential_print) {
         if (print) {
