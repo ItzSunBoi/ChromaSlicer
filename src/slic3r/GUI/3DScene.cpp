@@ -90,6 +90,20 @@ namespace Slic3r {
 
 static constexpr int FULL_COLOR_PREVIEW_UV_BINS = 16;
 
+static bool full_color_preview_allowed()
+{
+    const bool debug_override = ::getenv("ORCA_FULL_COLOR_PREVIEW") != nullptr;
+    if (GUI::wxGetApp().preset_bundle == nullptr)
+        return false;
+
+    const DynamicPrintConfig &config = GUI::wxGetApp().preset_bundle->full_config();
+    const bool enabled = config.has("enable_full_color_printing") && config.opt_bool("enable_full_color_printing");
+    BOOST_LOG_TRIVIAL(info) << "FullColor: enable_full_color_printing=" << (enabled ? "true" : "false")
+                            << (debug_override ? ", debug viewport override enabled" :
+                                (enabled ? ", full-color viewport preview allowed" : ", using normal viewport path"));
+    return enabled || debug_override;
+}
+
 static ColorRGBA full_color_preview_color(const RGBA &color)
 {
     return ColorRGBA(color[0], color[1], color[2], color[3]);
@@ -778,7 +792,9 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
         }
     } while (0);
 
-    if (allow_full_color_preview && !picking && (!full_color_texture_preview_models.empty() || !full_color_preview_models.empty())) {
+    const bool render_full_color_preview = allow_full_color_preview && !picking &&
+        (!full_color_texture_preview_models.empty() || !full_color_preview_models.empty()) && full_color_preview_allowed();
+    if (render_full_color_preview) {
         if (shader != nullptr && !full_color_texture_preview_models.empty()) {
             shader->set_uniform("uniform_texture", 0);
             shader->set_uniform("use_texture", true);

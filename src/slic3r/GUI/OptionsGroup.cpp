@@ -946,6 +946,9 @@ boost::any ConfigOptionsGroup::get_config_value(const DynamicPrintConfig& config
 	wxString text_value = wxString("");
 	const ConfigOptionDef* opt = config.def()->get(opt_key);
 
+    if (!config.has(opt_key) && opt_key == "enable_full_color_printing")
+        return false;
+
     if (opt->nullable)
     {
         switch (opt->type)

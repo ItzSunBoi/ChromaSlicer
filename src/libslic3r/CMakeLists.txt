@@ -193,6 +193,8 @@ set(lisbslic3r_sources
     Format/OBJ.hpp
     FullColor/FullColorSurfaceData.cpp
     FullColor/FullColorSurfaceData.hpp
+    FullColor/FullColorRasterPipeline.cpp
+    FullColor/FullColorRasterPipeline.hpp
     FullColor/ObjColorConvert.cpp
     FullColor/ObjColorConvert.hpp
     Format/objparser.cpp

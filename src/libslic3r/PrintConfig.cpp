@@ -700,6 +700,12 @@ void PrintConfigDef::init_common_params()
     def->mode     = comAdvanced;
     def->set_default_value(new ConfigOptionBool{false});
 
+    def           = this->add("enable_full_color_printing", coBool);
+    def->label    = L("Enable full-color printing");
+    def->tooltip  = L("Enables full-color model preview and experimental per-layer color raster generation for printers with an external/full-color print head.");
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionBool{false});
+
     def           = this->add("parallel_printheads_count", coInt);
     def->label    = L("Parallel printheads count");
     def->tooltip  = L("Set the number of parallel printheads for machines like OrangeStorm Giga printer.");
