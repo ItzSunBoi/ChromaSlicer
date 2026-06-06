@@ -337,7 +337,7 @@ Model Model::read_from_file(const std::string&                                  
     }
 #endif
     else
-        throw Slic3r::RuntimeError(_L("Unknown file format. Input file must have .stl, .obj, .amf(.xml) extension."));
+        throw Slic3r::RuntimeError(_L("Unknown file format. Supported model imports are .stl, .obj, .svg, .drc, .amf, and .3mf. On macOS, .usd/.usda/.usdc/.usdz/.abc/.ply are converted through ModelIO. Textured .glb/.gltf import is not implemented yet."));
 
     if (is_cb_cancel) {
         Model empty_model;

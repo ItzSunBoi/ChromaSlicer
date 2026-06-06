@@ -9,6 +9,7 @@
 #include "../GCode/ThumbnailData.hpp"
 #include "../Semver.hpp"
 #include "../Time.hpp"
+#include "../FullColor/FullColorSurfaceData.hpp"
 
 #include "../I18N.hpp"
 
@@ -139,6 +140,46 @@ static bool is_path_within_root(const std::string& file_path, const boost::files
     return true;
 }
 
+static nlohmann::json full_color_rgba_to_json(const Slic3r::RGBA& color)
+{
+    return nlohmann::json::array({ color[0], color[1], color[2], color[3] });
+}
+
+static Slic3r::RGBA full_color_rgba_from_json(const nlohmann::json& j, const Slic3r::RGBA& fallback = Slic3r::RGBA{0.8f, 0.8f, 0.8f, 1.0f})
+{
+    if (!j.is_array() || j.size() < 4)
+        return fallback;
+
+    return Slic3r::RGBA{
+        j.at(0).get<float>(),
+        j.at(1).get<float>(),
+        j.at(2).get<float>(),
+        j.at(3).get<float>()
+    };
+}
+
+static nlohmann::json full_color_uv_to_json(const std::array<Slic3r::Vec2f, 3>& uv)
+{
+    nlohmann::json out = nlohmann::json::array();
+    for (const Slic3r::Vec2f& p : uv)
+        out.push_back(nlohmann::json::array({ p.x(), p.y() }));
+    return out;
+}
+
+static std::array<Slic3r::Vec2f, 3> full_color_uv_from_json(const nlohmann::json& j)
+{
+    std::array<Slic3r::Vec2f, 3> uv{ Slic3r::Vec2f::Zero(), Slic3r::Vec2f::Zero(), Slic3r::Vec2f::Zero() };
+    if (!j.is_array())
+        return uv;
+
+    const size_t count = std::min<size_t>(3, j.size());
+    for (size_t i = 0; i < count; ++i) {
+        if (j.at(i).is_array() && j.at(i).size() >= 2)
+            uv[i] = Slic3r::Vec2f(j.at(i).at(0).get<float>(), j.at(i).at(1).get<float>());
+    }
+    return uv;
+}
+
 // VERSION NUMBERS
 // 0 : .3mf, files saved by older slic3r or other applications. No version definition in them.
 // 1 : Introduction of 3mf versioning. No other change in data saved into 3mf files.
@@ -223,6 +264,8 @@ const std::string PROJECT_EMBEDDED_SLICE_PRESETS_FILE = "Metadata/process_settin
 const std::string PROJECT_EMBEDDED_FILAMENT_PRESETS_FILE = "Metadata/filament_settings_";
 const std::string PROJECT_EMBEDDED_PRINTER_PRESETS_FILE = "Metadata/machine_settings_";
 const std::string CUT_INFORMATION_FILE = "Metadata/cut_information.xml";
+const std::string FULL_COLOR_DIR = "Metadata/full_color/";
+const char* FULL_COLOR_SURFACE_DATA_KEY = "full_color_surface_data";
 
 const unsigned int AUXILIARY_STR_LEN = 12;
 const unsigned int METADATA_STR_LEN = 9;
@@ -1123,6 +1166,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         /*IdToSlaSupportPointsMap m_sla_support_points;
         IdToSlaDrainHolesMap    m_sla_drain_holes;*/
         PathToEmbossShapeFileMap m_path_to_emboss_shape_files;
+        std::map<std::string, std::shared_ptr<FullColor::SurfaceData>> m_full_color_surface_data;
         std::string m_curr_metadata_name;
         std::string m_curr_characters;
         std::string m_name;
@@ -1200,6 +1244,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         void _extract_auxiliary_file_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat, Model& model);
         void _extract_file_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat);
         void _extract_embossed_svg_shape_file(const std::string &filename, mz_zip_archive &archive, const mz_zip_archive_file_stat &stat);
+        void _extract_full_color_surface_data_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat);
 
         // handlers to parse the .model file
         void _handle_start_model_xml_element(const char* name, const char** attributes);
@@ -1586,6 +1631,12 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 else if (boost::algorithm::iequals(name, FILAMENT_SEQUENCE_FILE)) {
                     _extract_filament_sequence_from_archive(archive, stat);
                 }
+                else if (boost::algorithm::istarts_with(name, FULL_COLOR_DIR) && boost::algorithm::iends_with(name, ".json")) {
+                    _extract_full_color_surface_data_from_archive(archive, stat);
+                }
+                else if (boost::algorithm::istarts_with(name, FULL_COLOR_DIR)) {
+                    _extract_file_from_archive(archive, stat);
+                }
             }
         }
 
@@ -1968,6 +2019,12 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 }
                 else if (!dont_load_config && boost::algorithm::iequals(name, FILAMENT_SEQUENCE_FILE)) {
                     _extract_filament_sequence_from_archive(archive, stat);
+                }
+                else if (boost::algorithm::istarts_with(name, FULL_COLOR_DIR) && boost::algorithm::iends_with(name, ".json")) {
+                    _extract_full_color_surface_data_from_archive(archive, stat);
+                }
+                else if (boost::algorithm::istarts_with(name, FULL_COLOR_DIR)) {
+                    _extract_file_from_archive(archive, stat);
                 }
                 else if (boost::algorithm::istarts_with(name, AUXILIARY_DIR)) {
                     // extract auxiliary directory to temp directory, do nothing for restore
@@ -2809,6 +2866,8 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             // BBS: use backup path
             //aux directory from model
             boost::filesystem::path dest_path = boost::filesystem::path(m_backup_path + "/" + src_file);
+            boost::system::error_code ec;
+            boost::filesystem::create_directories(dest_path.parent_path(), ec);
             std::string dest_zip_file = encode_path(dest_path.string().c_str());
             mz_bool res = mz_zip_reader_extract_to_file(&archive, stat.m_file_index, dest_zip_file.c_str(), 0);
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", extract  %1% from 3mf %2%, ret %3%\n") % dest_path % stat.m_filename % res;
@@ -2818,6 +2877,83 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             }
         }
         return;
+    }
+
+    void _BBS_3MF_Importer::_extract_full_color_surface_data_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat)
+    {
+        if (stat.m_uncomp_size == 0)
+            return;
+
+        std::string buffer((size_t)stat.m_uncomp_size, 0);
+        mz_bool res = mz_zip_reader_extract_to_mem(&archive, stat.m_file_index, (void*)buffer.data(), (size_t)stat.m_uncomp_size, 0);
+        if (res == 0) {
+            add_error("Error while reading full-color surface data");
+            return;
+        }
+
+        try {
+            const nlohmann::json j = nlohmann::json::parse(buffer);
+            if (j.value("format", "") != "OrcaSlicerFullColorSurfaceData") {
+                BOOST_LOG_TRIVIAL(warning) << "bbs_3mf: unsupported full-color surface data format in " << stat.m_filename;
+                return;
+            }
+
+            auto surface_data = std::make_shared<FullColor::SurfaceData>();
+            surface_data->source_path = j.value("source_path", "");
+            surface_data->has_vertex_colors = j.value("has_vertex_colors", false);
+            surface_data->has_face_colors = j.value("has_face_colors", false);
+            surface_data->has_textures = j.value("has_textures", false);
+
+            if (j.contains("vertex_colors") && j["vertex_colors"].is_array()) {
+                surface_data->vertex_colors.reserve(j["vertex_colors"].size());
+                for (const nlohmann::json& color_json : j["vertex_colors"])
+                    surface_data->vertex_colors.push_back(full_color_rgba_from_json(color_json));
+            }
+
+            if (j.contains("triangles") && j["triangles"].is_array()) {
+                surface_data->triangles.reserve(j["triangles"].size());
+                for (const nlohmann::json& triangle_json : j["triangles"]) {
+                    FullColor::TriangleColorData triangle;
+                    if (triangle_json.contains("uv"))
+                        triangle.uv = full_color_uv_from_json(triangle_json["uv"]);
+                    if (triangle_json.contains("fallback_color"))
+                        triangle.fallback_color = full_color_rgba_from_json(triangle_json["fallback_color"]);
+                    triangle.texture_index = triangle_json.value("texture_index", -1);
+                    triangle.has_uv = triangle_json.value("has_uv", false);
+                    triangle.has_color = triangle_json.value("has_color", false);
+                    surface_data->triangles.push_back(std::move(triangle));
+                }
+            }
+
+            if (j.contains("textures") && j["textures"].is_array()) {
+                surface_data->textures.reserve(j["textures"].size());
+                for (const nlohmann::json& texture_json : j["textures"]) {
+                    FullColor::TextureImage texture;
+                    texture.name = texture_json.value("name", "");
+                    texture.width = texture_json.value("width", 0);
+                    texture.height = texture_json.value("height", 0);
+
+                    const std::string archive_path = texture_json.value("archive_path", "");
+                    if (!archive_path.empty())
+                        texture.source_path = (boost::filesystem::path(m_backup_path) / archive_path).string();
+                    else
+                        texture.source_path = texture_json.value("source_path", "");
+
+                    surface_data->textures.push_back(std::move(texture));
+                }
+            }
+
+            if (!surface_data->empty()) {
+                std::string name(stat.m_filename);
+                std::replace(name.begin(), name.end(), '\\', '/');
+                m_full_color_surface_data[name] = std::move(surface_data);
+                BOOST_LOG_TRIVIAL(info) << "bbs_3mf: loaded full-color surface data: " << name
+                                        << ", triangles=" << m_full_color_surface_data[name]->triangles.size()
+                                        << ", textures=" << m_full_color_surface_data[name]->textures.size();
+            }
+        } catch (const std::exception& e) {
+            BOOST_LOG_TRIVIAL(warning) << "bbs_3mf: failed to parse full-color surface data '" << stat.m_filename << "': " << e.what();
+        }
     }
 
     void _BBS_3MF_Importer::_extract_layer_heights_profile_config_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat)
@@ -5109,6 +5245,16 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                     volume->source.is_converted_from_inches = metadata.value == "1";
                 else if (metadata.key == SOURCE_IN_METERS)
                     volume->source.is_converted_from_meters = metadata.value == "1";
+                else if (metadata.key == FULL_COLOR_SURFACE_DATA_KEY) {
+                    auto surface_it = m_full_color_surface_data.find(metadata.value);
+                    if (surface_it != m_full_color_surface_data.end()) {
+                        volume->full_color_data = surface_it->second;
+                        BOOST_LOG_TRIVIAL(info) << "bbs_3mf: restored full-color surface data for volume '" << volume->name
+                                                << "' from " << metadata.value;
+                    } else {
+                        BOOST_LOG_TRIVIAL(warning) << "bbs_3mf: missing full-color surface data referenced by volume: " << metadata.value;
+                    }
+                }
                 else if ((metadata.key == MATRIX_KEY) || (metadata.key == MESH_SHARED_KEY))
                     continue;
                 else
@@ -5259,6 +5405,16 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                     volume->source.is_converted_from_inches = metadata.value == "1";
                 else if (metadata.key == SOURCE_IN_METERS)
                     volume->source.is_converted_from_meters = metadata.value == "1";
+                else if (metadata.key == FULL_COLOR_SURFACE_DATA_KEY) {
+                    auto surface_it = m_full_color_surface_data.find(metadata.value);
+                    if (surface_it != m_full_color_surface_data.end()) {
+                        volume->full_color_data = surface_it->second;
+                        BOOST_LOG_TRIVIAL(info) << "bbs_3mf: restored full-color surface data for volume '" << volume->name
+                                                << "' from " << metadata.value;
+                    } else {
+                        BOOST_LOG_TRIVIAL(warning) << "bbs_3mf: missing full-color surface data referenced by volume: " << metadata.value;
+                    }
+                }
                 else
                     volume->config.set_deserialize(metadata.key, metadata.value, config_substitutions);
             }
@@ -5902,6 +6058,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         //BBS: add project embedded preset files
         bool _add_project_embedded_presets_to_archive(mz_zip_archive& archive, Model& model, std::vector<Preset*> project_presets);
         bool _add_model_config_file_to_archive(mz_zip_archive& archive, const Model& model, PlateDataPtrs& plate_data_list, const ObjectToObjectDataMap &objects_data, const DynamicPrintConfig& config, int export_plate_idx = -1, bool save_gcode = true, bool use_loaded_id = false);
+        bool _add_full_color_surface_data_to_archive(mz_zip_archive& archive, const ModelVolume& volume, const std::string& path_in_zip);
         bool _add_cut_information_file_to_archive(mz_zip_archive &archive, Model &model);
         bool _add_slice_info_config_file_to_archive(mz_zip_archive &archive, const Model &model, PlateDataPtrs &plate_data_list, const ObjectToObjectDataMap &objects_data, const DynamicPrintConfig& config);
         bool _add_filament_sequence_file_to_archive(mz_zip_archive& archive, const PlateDataPtrs& plate_data_list);
@@ -6526,6 +6683,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         stream << " <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\n";
         stream << " <Default Extension=\"model\" ContentType=\"application/vnd.ms-package.3dmanufacturing-3dmodel+xml\"/>\n";
         stream << " <Default Extension=\"png\" ContentType=\"image/png\"/>\n";
+        stream << " <Default Extension=\"json\" ContentType=\"application/json\"/>\n";
         stream << " <Default Extension=\"gcode\" ContentType=\"text/x.gcode\"/>\n";
         stream << "</Types>";
 
@@ -6640,6 +6798,75 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             return false;
         }
 
+        return true;
+    }
+
+    bool _BBS_3MF_Exporter::_add_full_color_surface_data_to_archive(mz_zip_archive& archive, const ModelVolume& volume, const std::string& path_in_zip)
+    {
+        const std::shared_ptr<FullColor::SurfaceData>& surface_data = volume.full_color_data;
+        if (!surface_data || surface_data->empty())
+            return true;
+
+        nlohmann::json j;
+        j["format"] = "OrcaSlicerFullColorSurfaceData";
+        j["version"] = 1;
+        j["source_path"] = surface_data->source_path;
+        j["has_vertex_colors"] = surface_data->has_vertex_colors;
+        j["has_face_colors"] = surface_data->has_face_colors;
+        j["has_textures"] = surface_data->has_textures;
+
+        j["vertex_colors"] = nlohmann::json::array();
+        for (const RGBA& color : surface_data->vertex_colors)
+            j["vertex_colors"].push_back(full_color_rgba_to_json(color));
+
+        j["triangles"] = nlohmann::json::array();
+        for (const FullColor::TriangleColorData& triangle : surface_data->triangles) {
+            nlohmann::json triangle_json;
+            triangle_json["uv"] = full_color_uv_to_json(triangle.uv);
+            triangle_json["fallback_color"] = full_color_rgba_to_json(triangle.fallback_color);
+            triangle_json["texture_index"] = triangle.texture_index;
+            triangle_json["has_uv"] = triangle.has_uv;
+            triangle_json["has_color"] = triangle.has_color;
+            j["triangles"].push_back(std::move(triangle_json));
+        }
+
+        const boost::filesystem::path manifest_path(path_in_zip);
+        const std::string texture_dir = (manifest_path.parent_path() / manifest_path.stem()).generic_string() + "_textures/";
+        j["textures"] = nlohmann::json::array();
+        for (size_t texture_idx = 0; texture_idx < surface_data->textures.size(); ++texture_idx) {
+            const FullColor::TextureImage& texture = surface_data->textures[texture_idx];
+            nlohmann::json texture_json;
+            texture_json["name"] = texture.name;
+            texture_json["source_path"] = texture.source_path.string();
+            texture_json["width"] = texture.width;
+            texture_json["height"] = texture.height;
+
+            const boost::filesystem::path source_path(texture.source_path.string());
+            if (!source_path.empty() && boost::filesystem::exists(source_path)) {
+                const std::string archive_path = texture_dir + (boost::format("texture_%1%_%2%") % texture_idx % source_path.filename().string()).str();
+                if (!_add_file_to_archive(archive, archive_path, source_path.string())) {
+                    BOOST_LOG_TRIVIAL(warning) << "bbs_3mf: failed to preserve full-color texture '" << source_path.string() << "'";
+                    return false;
+                }
+                texture_json["archive_path"] = archive_path;
+            } else {
+                texture_json["archive_path"] = "";
+                BOOST_LOG_TRIVIAL(warning) << "bbs_3mf: full-color texture source missing during save: " << texture.source_path.string();
+            }
+
+            j["textures"].push_back(std::move(texture_json));
+        }
+
+        const std::string out = j.dump();
+        if (!mz_zip_writer_add_mem(&archive, path_in_zip.c_str(), (const void*)out.data(), out.length(), MZ_DEFAULT_COMPRESSION)) {
+            add_error("Unable to add full-color surface data file to archive");
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ":" << __LINE__ << boost::format(", Unable to add full-color surface data %1%\n") % path_in_zip;
+            return false;
+        }
+
+        BOOST_LOG_TRIVIAL(info) << "bbs_3mf: preserved full-color surface data: " << path_in_zip
+                                << ", triangles=" << surface_data->triangles.size()
+                                << ", textures=" << surface_data->textures.size();
         return true;
     }
 
@@ -7871,6 +8098,14 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                                     stream << prefix << SOURCE_IN_INCHES << "\" " << VALUE_ATTR << "=\"1\"/>\n";
                                 else if (volume->source.is_converted_from_meters)
                                     stream << prefix << SOURCE_IN_METERS << "\" " << VALUE_ATTR << "=\"1\"/>\n";
+                            }
+
+                            if (volume->full_color_data && !volume->full_color_data->empty()) {
+                                const std::string full_color_path = (boost::format("%1%object_%2%_volume_%3%.json") % FULL_COLOR_DIR % object_data.object_id % volume_id).str();
+                                if (!_add_full_color_surface_data_to_archive(archive, *volume, full_color_path))
+                                    return false;
+                                stream << "      <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << FULL_COLOR_SURFACE_DATA_KEY
+                                       << "\" " << VALUE_ATTR << "=\"" << xml_escape(full_color_path) << "\"/>\n";
                             }
 
                             // stores volume's config data

@@ -3396,6 +3396,7 @@ void GLCanvas3D::on_char(wxKeyEvent& evt)
 #else /* __APPLE__ */
         case WXK_CONTROL_F:
 #endif /* __APPLE__ */
+            evt.Skip();
             break;
 
 

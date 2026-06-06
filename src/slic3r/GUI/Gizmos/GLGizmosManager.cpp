@@ -485,8 +485,18 @@ bool GLGizmosManager::handle_shortcut(int key)
     };
     auto it = std::find_if(m_gizmos.begin(), m_gizmos.end(), is_gizmo);
 
-    if (it == m_gizmos.end())
+    if (it == m_gizmos.end()) {
+        auto matching_inactive = std::find_if(m_gizmos.begin(), m_gizmos.end(), [is_key](const std::unique_ptr<GLGizmoBase> &gizmo) {
+            return is_key(gizmo->get_shortcut_key());
+        });
+        if (matching_inactive != m_gizmos.end()) {
+            BOOST_LOG_TRIVIAL(info) << "GLGizmosManager: shortcut matched inactive gizmo '"
+                                    << (*matching_inactive)->get_name()
+                                    << "'; selection_empty=" << m_parent.get_selection().is_empty()
+                                    << ", single_full_instance=" << m_parent.get_selection().is_single_full_instance();
+        }
         return false;
+    }
 
     EType gizmo_type = EType(it - m_gizmos.begin());
     return open_gizmo(gizmo_type);
