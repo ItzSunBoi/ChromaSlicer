@@ -60,8 +60,23 @@ static void generate_full_color_chroma_for_slice_preview(
             << "FullColor Slice Preview: generating Chroma sidecar for preview path="
             << preview_gcode_path;
 
+        std::string package_gcode_filename = "full_color_print.gcode";
+        try {
+            package_gcode_filename = boost::filesystem::path(fff_print->output_filename()).filename().string();
+        } catch (const std::exception& e) {
+            BOOST_LOG_TRIVIAL(warning)
+                << "FullColor Slice Preview: failed to resolve display G-code filename, using fallback: "
+                << e.what();
+        }
+
         const Slic3r::FullColor::RasterPipelineOutput chroma_output =
-            Slic3r::FullColor::generate_full_color_rasters(*fff_print, preview_gcode_path);
+            Slic3r::FullColor::generate_full_color_rasters(
+                *fff_print,
+                preview_gcode_path,
+                package_gcode_filename,
+                [fff_print](int percent, const std::string& message) {
+                    fff_print->set_status(percent, message);
+                });
 
         BOOST_LOG_TRIVIAL(info)
             << "FullColor Slice Preview: generated="
@@ -900,6 +915,10 @@ void BackgroundSlicingProcess::finalize_gcode()
 
 	std::string exported_chroma_path;
 	if (copy_full_color_chroma_export(m_fff_print, output_path, export_path, m_export_path_on_removable_media, exported_chroma_path)) {
+		auto evt = new wxCommandEvent(m_event_export_finished_id, GUI::wxGetApp().mainframe->m_plater->GetId());
+		wxString output_chroma_str = wxString::FromUTF8(exported_chroma_path.c_str(), exported_chroma_path.length());
+		evt->SetString(output_chroma_str);
+		wxQueueEvent(GUI::wxGetApp().mainframe->m_plater, evt);
 		m_print->set_status(100, GUI::format(_L("Chroma package exported to %1%"), exported_chroma_path));
 		return;
 	}

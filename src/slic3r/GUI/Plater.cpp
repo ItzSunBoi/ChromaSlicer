@@ -9786,6 +9786,12 @@ void Plater::priv::on_export_began(wxCommandEvent& evt)
 
 void Plater::priv::on_export_finished(wxCommandEvent& evt)
 {
+    const std::string exported_path = std::string(evt.GetString().ToUTF8().data());
+    if (!exported_path.empty()) {
+        last_output_path = exported_path;
+        last_output_dir_path = fs::path(exported_path).parent_path().string();
+    }
+
 #if 0
     //BBS: also export 3mf to the same directory for debugging
     std::string gcode_path_str(evt.GetString().ToUTF8().data());

@@ -20,6 +20,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <ctime>
+#include <functional>
 #include <fstream>
 #include <iomanip>
 #include <iterator>
@@ -152,6 +154,11 @@ struct LayerRasterMask
     std::vector<BoundingBox> bboxes;
 
     bool empty() const { return printable_area.empty(); }
+};
+
+struct LayerMaskRowIndex
+{
+    std::vector<std::vector<size_t>> rows;
 };
 
 struct RasterTiming
@@ -529,14 +536,25 @@ static LayerPixelBounds layer_pixel_bounds(
     return bounds;
 }
 
-static Point scaled_point(const double x, const double y)
-{
-    return Point(scale_(x), scale_(y));
-}
-
 static bool contains_point(const LayerRasterMask &mask, const Point &point)
 {
     for (size_t idx = 0; idx < mask.printable_area.size(); ++idx) {
+        if (idx < mask.bboxes.size() && !mask.bboxes[idx].contains(point))
+            continue;
+        if (mask.printable_area[idx].contains(point, true))
+            return true;
+    }
+    return false;
+}
+
+static bool contains_point_indexed(const LayerRasterMask &mask, const LayerMaskRowIndex &row_index, int y, const Point &point)
+{
+    if (y < 0 || static_cast<size_t>(y) >= row_index.rows.size())
+        return contains_point(mask, point);
+
+    for (const size_t idx : row_index.rows[static_cast<size_t>(y)]) {
+        if (idx >= mask.printable_area.size())
+            continue;
         if (idx < mask.bboxes.size() && !mask.bboxes[idx].contains(point))
             continue;
         if (mask.printable_area[idx].contains(point, true))
@@ -590,6 +608,31 @@ static LayerRasterMask build_layer_fdm_mask(const Print &print, const LayerRaste
     for (const ExPolygon &expoly : mask.printable_area)
         mask.bboxes.emplace_back(get_extents(expoly));
     return mask;
+}
+
+static LayerMaskRowIndex build_layer_mask_row_index(
+    const LayerRasterMask &mask,
+    const Vec3d &min_pt,
+    int height)
+{
+    LayerMaskRowIndex index;
+    index.rows.resize(static_cast<size_t>(height));
+    if (mask.empty() || height <= 0)
+        return index;
+
+    for (size_t idx = 0; idx < mask.bboxes.size(); ++idx) {
+        const BoundingBox &bbox = mask.bboxes[idx];
+        const double min_y = unscale<double>(bbox.min.y());
+        const double max_y = unscale<double>(bbox.max.y());
+
+        const int y0 = std::clamp(static_cast<int>(std::floor((min_y - min_pt.y()) / FULL_COLOR_PIXEL_SIZE_MM)) - 1, 0, height - 1);
+        const int y1 = std::clamp(static_cast<int>(std::ceil ((max_y - min_pt.y()) / FULL_COLOR_PIXEL_SIZE_MM)) + 1, 0, height - 1);
+
+        for (int y = y0; y <= y1; ++y)
+            index.rows[static_cast<size_t>(y)].push_back(idx);
+    }
+
+    return index;
 }
 
 static LayerPixelBounds layer_mask_pixel_bounds(
@@ -809,6 +852,21 @@ static boost::filesystem::path chroma_output_path_for_gcode(const std::string &g
     return fallback;
 }
 
+static std::string safe_package_gcode_filename(const std::string &requested_name, const std::string &source_gcode_path)
+{
+    boost::filesystem::path filename = boost::filesystem::path(requested_name).filename();
+    if (filename.empty())
+        filename = boost::filesystem::path(source_gcode_path).filename();
+
+    std::string out = filename.string();
+    if (out.empty() || out.front() == '.')
+        out = "full_color_print.gcode";
+
+    boost::filesystem::path normalized(out);
+    normalized.replace_extension(".gcode");
+    return normalized.filename().string();
+}
+
 static void write_u16(std::ofstream &out, std::uint16_t value)
 {
     out.put(static_cast<char>(value & 0xff));
@@ -829,7 +887,31 @@ struct ZipEntryInfo
     std::uint32_t crc = 0;
     std::uint32_t size = 0;
     std::uint32_t local_header_offset = 0;
+    std::uint16_t mod_time = 0;
+    std::uint16_t mod_date = 0;
 };
+
+struct ZipTimestamp
+{
+    std::uint16_t time = 0;
+    std::uint16_t date = 0;
+};
+
+static ZipTimestamp current_zip_timestamp()
+{
+    const std::time_t now = std::time(nullptr);
+    std::tm local_tm {};
+#ifdef _WIN32
+    localtime_s(&local_tm, &now);
+#else
+    localtime_r(&now, &local_tm);
+#endif
+    const int year = std::clamp(local_tm.tm_year + 1900, 1980, 2107);
+    return {
+        static_cast<std::uint16_t>((local_tm.tm_hour << 11) | (local_tm.tm_min << 5) | (local_tm.tm_sec / 2)),
+        static_cast<std::uint16_t>(((year - 1980) << 9) | ((local_tm.tm_mon + 1) << 5) | local_tm.tm_mday)
+    };
+}
 
 static std::string zip_relative_name(const boost::filesystem::path &root, const boost::filesystem::path &file)
 {
@@ -889,6 +971,7 @@ static bool write_stored_zip_from_directory(
 
         std::vector<ZipEntryInfo> entries;
         entries.reserve(files.size());
+        const ZipTimestamp timestamp = current_zip_timestamp();
 
         for (const boost::filesystem::path &file : files) {
             boost::nowide::ifstream in(file.string(), std::ios::binary);
@@ -916,13 +999,15 @@ static bool write_stored_zip_from_directory(
             entry.size = static_cast<std::uint32_t>(data.size());
             entry.crc = static_cast<std::uint32_t>(crc32(0L, data.data(), static_cast<uInt>(data.size())));
             entry.local_header_offset = static_cast<std::uint32_t>(out.tellp());
+            entry.mod_time = timestamp.time;
+            entry.mod_date = timestamp.date;
 
             write_u32(out, 0x04034b50);
             write_u16(out, 20);
             write_u16(out, 0);
             write_u16(out, 0);
-            write_u16(out, 0);
-            write_u16(out, 0);
+            write_u16(out, entry.mod_time);
+            write_u16(out, entry.mod_date);
             write_u32(out, entry.crc);
             write_u32(out, entry.size);
             write_u32(out, entry.size);
@@ -943,8 +1028,8 @@ static bool write_stored_zip_from_directory(
             write_u16(out, 20);
             write_u16(out, 0);
             write_u16(out, 0);
-            write_u16(out, 0);
-            write_u16(out, 0);
+            write_u16(out, entry.mod_time);
+            write_u16(out, entry.mod_date);
             write_u32(out, entry.crc);
             write_u32(out, entry.size);
             write_u32(out, entry.size);
@@ -1114,7 +1199,11 @@ RasterPipelineSummary collect_full_color_raster_summary(const Model &model, cons
     return collect_full_color_raster_summary(model, config.enable_full_color_printing.value);
 }
 
-RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::string &gcode_path)
+RasterPipelineOutput generate_full_color_rasters(
+    const Print &print,
+    const std::string &gcode_path,
+    const std::string &package_gcode_filename,
+    std::function<void(int, const std::string&)> status_callback)
 {
     const auto total_start = RasterClock::now();
     RasterTiming timing;
@@ -1133,6 +1222,8 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
 
     const double shell_thickness = std::max(0.01, print.config().full_color_shell_thickness.value);
     const RasterDebugMode debug_mode = raster_debug_mode();
+    if (status_callback)
+        status_callback(81, "Preparing full-color raster data");
     BOOST_LOG_TRIVIAL(info) << "FullColor Raster: generating layer rasters";
     BOOST_LOG_TRIVIAL(info) << "FullColor Raster: pixel_size=" << FULL_COLOR_PIXEL_SIZE_MM << " mm";
     BOOST_LOG_TRIVIAL(info) << "FullColor Raster: shell_thickness=" << shell_thickness << " mm";
@@ -1274,6 +1365,7 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
     const bool triangle_mapping_validated =
         validated_volume_count > 0 && skipped_mapping_mismatch_volume_count == 0 &&
         triangle_count_mesh == triangle_count_full_color_metadata;
+    const std::string gcode_filename = safe_package_gcode_filename(package_gcode_filename, gcode_path);
 
     if (!gcode_path.empty() && boost::filesystem::exists(gcode_path)) {
         const auto copy_start = RasterClock::now();
@@ -1281,7 +1373,7 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
             const boost::filesystem::path gcode_src(gcode_path);
             boost::filesystem::copy_file(
                 gcode_src,
-                staging_dir / gcode_src.filename(),
+                staging_dir / gcode_filename,
                 boost::filesystem::copy_option::overwrite_if_exists);
         } catch (const std::exception &e) {
             BOOST_LOG_TRIVIAL(error) << "FullColor Raster: failed to copy G-code into package staging: " << e.what();
@@ -1291,7 +1383,6 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
         BOOST_LOG_TRIVIAL(warning) << "FullColor Raster: G-code file not available for package root: " << gcode_path;
     }
 
-    const std::string gcode_filename = boost::filesystem::path(gcode_path).filename().string();
     const double first_layer_height = layers.empty() ? 0.0 : layers.front().z1 - layers.front().z0;
     const double nominal_layer_height = layers.size() > 1 ? layers[1].z1 - layers[0].z1 : first_layer_height;
     const bool vertex_colors_present = std::any_of(print.model().objects.begin(), print.model().objects.end(), [](const ModelObject *object) {
@@ -1419,16 +1510,39 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
     };
     manifest["layers"] = json::array();
 
+    std::vector<double> pixel_center_x(static_cast<size_t>(width));
+    std::vector<double> pixel_center_y(static_cast<size_t>(height));
+    std::vector<coord_t> scaled_pixel_center_x(static_cast<size_t>(width));
+    std::vector<coord_t> scaled_pixel_center_y(static_cast<size_t>(height));
+    for (int x = 0; x < width; ++x) {
+        pixel_center_x[static_cast<size_t>(x)] = min_pt.x() + (x + 0.5) * FULL_COLOR_PIXEL_SIZE_MM;
+        scaled_pixel_center_x[static_cast<size_t>(x)] = scale_(pixel_center_x[static_cast<size_t>(x)]);
+    }
+    for (int y = 0; y < height; ++y) {
+        pixel_center_y[static_cast<size_t>(y)] = min_pt.y() + (y + 0.5) * FULL_COLOR_PIXEL_SIZE_MM;
+        scaled_pixel_center_y[static_cast<size_t>(y)] = scale_(pixel_center_y[static_cast<size_t>(y)]);
+    }
+
+    const size_t image_size = static_cast<size_t>(width) * static_cast<size_t>(height) * 3;
+    std::vector<std::uint8_t> image(image_size, 255);
+    std::vector<LayerDebugCounters> row_counters(static_cast<size_t>(height));
+
     for (const LayerRasterInfo &layer : layers) {
+        if (status_callback) {
+            const int percent = 82 + static_cast<int>((12.0 * static_cast<double>(layer.index)) / std::max<size_t>(layers.size(), 1));
+            status_callback(percent, "Generating full-color rasters: layer " + std::to_string(layer.index + 1) + "/" + std::to_string(layers.size()));
+        }
+
         const auto layer_start = RasterClock::now();
         LayerDebugCounters counters;
         counters.total_pixels = static_cast<size_t>(width) * static_cast<size_t>(height);
-        std::vector<std::uint8_t> image(static_cast<size_t>(width) * static_cast<size_t>(height) * 3, 255);
+        std::fill(image.begin(), image.end(), 255);
+        std::fill(row_counters.begin(), row_counters.end(), LayerDebugCounters{});
         const LayerRasterMask fdm_mask = build_layer_fdm_mask(print, layer);
+        const LayerMaskRowIndex fdm_row_index = build_layer_mask_row_index(fdm_mask, min_pt, height);
         const LayerPixelBounds color_bounds = layer_pixel_bounds(triangles, min_pt, width, height, layer.sample_z, shell_thickness);
         const LayerPixelBounds mask_bounds = layer_mask_pixel_bounds(fdm_mask, min_pt, width, height);
         const LayerPixelBounds active_bounds = intersect_bounds(color_bounds, mask_bounds);
-        std::vector<LayerDebugCounters> row_counters(static_cast<size_t>(height));
 
         if (!fdm_mask.empty() && !active_bounds.empty()) {
             tbb::parallel_for(
@@ -1436,13 +1550,14 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
                 [&](const tbb::blocked_range<int> &range) {
                     for (int y = range.begin(); y != range.end(); ++y) {
                         LayerDebugCounters local;
-                        const double py = min_pt.y() + (y + 0.5) * FULL_COLOR_PIXEL_SIZE_MM;
+                        const double py = pixel_center_y[static_cast<size_t>(y)];
+                        const coord_t sy = scaled_pixel_center_y[static_cast<size_t>(y)];
                         for (int x = active_bounds.min_x; x <= active_bounds.max_x; ++x) {
                             const Vec3d query(
-                                min_pt.x() + (x + 0.5) * FULL_COLOR_PIXEL_SIZE_MM,
+                                pixel_center_x[static_cast<size_t>(x)],
                                 py,
                                 layer.sample_z);
-                            if (!contains_point(fdm_mask, scaled_point(query.x(), query.y()))) {
+                            if (!contains_point_indexed(fdm_mask, fdm_row_index, y, Point(scaled_pixel_center_x[static_cast<size_t>(x)], sy))) {
                                 ++local.rejected_by_fdm_mask;
                                 continue;
                             }
@@ -1582,6 +1697,8 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
     const boost::filesystem::path manifest_path = staging_dir / "manifest.json";
     timing.layer_average_ms = layers.empty() ? 0.0 : timing.layer_raster_total_ms / static_cast<double>(layers.size());
     timing.total_ms = elapsed_ms(total_start);
+    if (status_callback)
+        status_callback(95, "Packaging full-color Chroma output");
     manifest["timing"] = {
         {"total_before_packaging_ms", timing.total_ms},
         {"surface_triangle_preparation_ms", timing.surface_prep_ms},

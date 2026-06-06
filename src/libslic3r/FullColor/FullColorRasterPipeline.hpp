@@ -2,6 +2,7 @@
 #define slic3r_FullColorRasterPipeline_hpp_
 
 #include <cstddef>
+#include <functional>
 #include <string>
 
 namespace Slic3r {
@@ -42,7 +43,9 @@ RasterPipelineSummary collect_full_color_raster_summary(
 
 RasterPipelineOutput generate_full_color_rasters(
     const Print &print,
-    const std::string &gcode_path);
+    const std::string &gcode_path,
+    const std::string &package_gcode_filename = {},
+    std::function<void(int, const std::string&)> status_callback = {});
 
 } // namespace FullColor
 } // namespace Slic3r
