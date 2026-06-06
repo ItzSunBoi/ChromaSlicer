@@ -842,13 +842,27 @@ bool Selection::is_single_full_instance() const
         const GLVolume* v = (*m_volumes)[i];
         if (object_idx != v->object_idx() || instance_idx != v->instance_idx())
             return false;
+        if (v->is_wipe_tower || v->is_modifier)
+            return false;
 
         int volume_idx = v->volume_idx();
         if (volume_idx >= 0)
             volumes_idxs.insert(volume_idx);
     }
 
-    return m_model->objects[object_idx]->volumes.size() == volumes_idxs.size();
+    std::set<int> instance_volume_idxs;
+    for (const GLVolume* v : *m_volumes) {
+        if (v == nullptr || v->is_wipe_tower || v->is_modifier)
+            continue;
+        if (object_idx != v->object_idx() || instance_idx != v->instance_idx())
+            continue;
+
+        int volume_idx = v->volume_idx();
+        if (volume_idx >= 0)
+            instance_volume_idxs.insert(volume_idx);
+    }
+
+    return !instance_volume_idxs.empty() && instance_volume_idxs.size() == volumes_idxs.size();
 }
 
 bool Selection::is_from_single_object() const

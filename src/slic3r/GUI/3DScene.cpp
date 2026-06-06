@@ -855,27 +855,13 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
         }
     } while (0);
 
-    const bool render_full_color_preview = allow_full_color_preview && !picking &&
+    const GUI::GLCanvas3D* canvas = GUI::wxGetApp().plater() != nullptr ? GUI::wxGetApp().plater()->canvas3D() : nullptr;
+    const bool suppress_full_color_preview = canvas != nullptr &&
+        (canvas->is_mouse_dragging() || canvas->is_dragging() || canvas->get_move_volume_id() != -1);
+    const bool render_full_color_preview = allow_full_color_preview && !suppress_full_color_preview && !picking &&
         (!full_color_texture_preview_models.empty() || !full_color_preview_models.empty()) && full_color_preview_allowed();
-    if (render_full_color_preview) {
-        if (shader != nullptr && !full_color_texture_preview_models.empty()) {
-            GLFullColorStateGuard state_guard;
-            shader->set_uniform("uniform_texture", 0);
-            shader->set_uniform("use_texture", true);
-            glsafe(::glActiveTexture(GL_TEXTURE0));
-            for (std::unique_ptr<GLFullColorTexturePreview> &preview : full_color_texture_preview_models) {
-                if (!preview || !preview->model.is_initialized() || preview->texture.get_id() == 0)
-                    continue;
 
-                glsafe(::glBindTexture(GL_TEXTURE_2D, preview->texture.get_id()));
-                preview->model.render(shader);
-            }
-            glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
-            shader->set_uniform("use_texture", false);
-        }
-        for (GUI::GLModel &preview_model : full_color_preview_models)
-            preview_model.render(shader);
-    } else if (color_volume && !picking) {
+    if (color_volume && !picking) {
         // when force_transparent, we need to keep the alpha
         if (force_native_color && render_color.is_transparent()) {
             for (auto &extruder_color : extruder_colors)
@@ -929,6 +915,37 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
             model.render(shader);
         else
             model.render(this->tverts_range, shader);
+    }
+
+    if (render_full_color_preview) {
+        GLboolean depth_test_enabled = GL_FALSE;
+        GLint depth_func = GL_LESS;
+        glsafe(::glGetBooleanv(GL_DEPTH_TEST, &depth_test_enabled));
+        glsafe(::glGetIntegerv(GL_DEPTH_FUNC, &depth_func));
+        glsafe(::glEnable(GL_DEPTH_TEST));
+        glsafe(::glDepthFunc(GL_LEQUAL));
+
+        if (shader != nullptr && !full_color_texture_preview_models.empty()) {
+            GLFullColorStateGuard state_guard;
+            shader->set_uniform("uniform_texture", 0);
+            shader->set_uniform("use_texture", true);
+            glsafe(::glActiveTexture(GL_TEXTURE0));
+            for (std::unique_ptr<GLFullColorTexturePreview> &preview : full_color_texture_preview_models) {
+                if (!preview || !preview->model.is_initialized() || preview->texture.get_id() == 0)
+                    continue;
+
+                glsafe(::glBindTexture(GL_TEXTURE_2D, preview->texture.get_id()));
+                preview->model.render(shader);
+            }
+            glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
+            shader->set_uniform("use_texture", false);
+        }
+        for (GUI::GLModel &preview_model : full_color_preview_models)
+            preview_model.render(shader);
+
+        glsafe(::glDepthFunc(static_cast<GLenum>(depth_func)));
+        if (!depth_test_enabled)
+            glsafe(::glDisable(GL_DEPTH_TEST));
     }
     if (this->is_left_handed())
         glFrontFace(GL_CCW);

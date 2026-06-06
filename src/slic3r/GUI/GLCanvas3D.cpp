@@ -3396,7 +3396,6 @@ void GLCanvas3D::on_char(wxKeyEvent& evt)
 #else /* __APPLE__ */
         case WXK_CONTROL_F:
 #endif /* __APPLE__ */
-            evt.Skip();
             break;
 
 
@@ -4301,8 +4300,9 @@ void GLCanvas3D::on_mouse(wxMouseEvent& evt)
         // Not only detection of some modifiers !!!
         if (evt.Dragging()) {
             GLGizmosManager::EType c = m_gizmos.get_current_type();
-            if (current_printer_technology() == ptFFF &&
-                (fff_print()->config().print_sequence == PrintSequence::ByObject)) {
+            const Print* print = fff_print();
+            if (current_printer_technology() == ptFFF && print != nullptr &&
+                (print->config().print_sequence == PrintSequence::ByObject)) {
                 if (can_sequential_clearance_show_in_gizmo())
                     update_sequential_clearance();
             } else {
@@ -4524,7 +4524,8 @@ void GLCanvas3D::on_mouse(wxMouseEvent& evt)
                 TransformationType trafo_type;
                 trafo_type.set_relative();
                 m_selection.translate(cur_pos - m_mouse.drag.start_position_3D, trafo_type);
-                if (current_printer_technology() == ptFFF && (fff_print()->config().print_sequence == PrintSequence::ByObject))
+                const Print* print = fff_print();
+                if (current_printer_technology() == ptFFF && print != nullptr && (print->config().print_sequence == PrintSequence::ByObject))
                     update_sequential_clearance();
                 // BBS
                 //wxGetApp().obj_manipul()->set_dirty();
@@ -4955,18 +4956,28 @@ void GLCanvas3D::do_move(const std::string& snapshot_type)
         int instance_idx = v->instance_idx();
         int volume_idx = v->volume_idx();
 
-        if (volume_idx < 0)
-            continue;
-
-        std::pair<int, int> done_id(object_idx, instance_idx);
-
         if (0 <= object_idx && object_idx < (int)m_model->objects.size()) {
-            done.insert(done_id);
-
             // Move instances/volumes
             ModelObject* model_object = m_model->objects[object_idx];
             if (model_object == nullptr) 
                 continue;
+
+            if (instance_idx < 0 || instance_idx >= (int)model_object->instances.size()) {
+                BOOST_LOG_TRIVIAL(warning) << "GLCanvas3D::do_move: skipping volume with stale instance index: object_idx="
+                                           << object_idx << ", instance_idx=" << instance_idx
+                                           << ", instance_count=" << model_object->instances.size();
+                continue;
+            }
+
+            if (volume_idx < 0 || volume_idx >= (int)model_object->volumes.size()) {
+                BOOST_LOG_TRIVIAL(warning) << "GLCanvas3D::do_move: skipping volume with stale volume index: object_idx="
+                                           << object_idx << ", volume_idx=" << volume_idx
+                                           << ", volume_count=" << model_object->volumes.size();
+                continue;
+            }
+
+            std::pair<int, int> done_id(object_idx, instance_idx);
+            done.insert(done_id);
 
             if (selection_mode == Selection::Instance) {
                 if (m_canvas_type == GLCanvas3D::ECanvasType::CanvasAssembleView) {
@@ -5086,15 +5097,26 @@ void GLCanvas3D::do_rotate(const std::string& snapshot_type)
         const int instance_idx = v->instance_idx();
         const int volume_idx = v->volume_idx();
 
-        if (volume_idx < 0)
-            continue;
-
-        done.insert(std::pair<int, int>(object_idx, instance_idx));
-
         // Rotate instances/volumes.
         ModelObject* model_object = m_model->objects[object_idx];
         if (model_object == nullptr)
             continue;
+
+        if (instance_idx < 0 || instance_idx >= (int)model_object->instances.size()) {
+            BOOST_LOG_TRIVIAL(warning) << "GLCanvas3D::do_rotate: skipping volume with stale instance index: object_idx="
+                                       << object_idx << ", instance_idx=" << instance_idx
+                                       << ", instance_count=" << model_object->instances.size();
+            continue;
+        }
+
+        if (volume_idx < 0 || volume_idx >= (int)model_object->volumes.size()) {
+            BOOST_LOG_TRIVIAL(warning) << "GLCanvas3D::do_rotate: skipping volume with stale volume index: object_idx="
+                                       << object_idx << ", volume_idx=" << volume_idx
+                                       << ", volume_count=" << model_object->volumes.size();
+            continue;
+        }
+
+        done.insert(std::pair<int, int>(object_idx, instance_idx));
 
         if (selection_mode == Selection::Instance) {
             if (m_canvas_type == GLCanvas3D::ECanvasType::CanvasAssembleView) {
@@ -5182,15 +5204,26 @@ void GLCanvas3D::do_scale(const std::string& snapshot_type)
         const int instance_idx = v->instance_idx();
         const int volume_idx = v->volume_idx();
 
-        if (volume_idx < 0)
-            continue;
-
-        done.insert(std::pair<int, int>(object_idx, instance_idx));
-
         // Rotate instances/volumes
         ModelObject* model_object = m_model->objects[object_idx];
         if (model_object == nullptr)
             continue;
+
+        if (instance_idx < 0 || instance_idx >= (int)model_object->instances.size()) {
+            BOOST_LOG_TRIVIAL(warning) << "GLCanvas3D::do_scale: skipping volume with stale instance index: object_idx="
+                                       << object_idx << ", instance_idx=" << instance_idx
+                                       << ", instance_count=" << model_object->instances.size();
+            continue;
+        }
+
+        if (volume_idx < 0 || volume_idx >= (int)model_object->volumes.size()) {
+            BOOST_LOG_TRIVIAL(warning) << "GLCanvas3D::do_scale: skipping volume with stale volume index: object_idx="
+                                       << object_idx << ", volume_idx=" << volume_idx
+                                       << ", volume_count=" << model_object->volumes.size();
+            continue;
+        }
+
+        done.insert(std::pair<int, int>(object_idx, instance_idx));
 
         if (selection_mode == Selection::Instance) {
             model_object->instances[instance_idx]->set_transformation(v->get_instance_transformation());
@@ -5565,7 +5598,8 @@ bool GLCanvas3D::can_sequential_clearance_show_in_gizmo() {
 
 void GLCanvas3D::update_sequential_clearance()
 {
-    if (current_printer_technology() != ptFFF || (fff_print()->config().print_sequence == PrintSequence::ByLayer))
+    const Print* print = fff_print();
+    if (current_printer_technology() != ptFFF || print == nullptr || (print->config().print_sequence == PrintSequence::ByLayer))
         return;
 
     if (m_gizmos.is_dragging())
@@ -5592,6 +5626,11 @@ void GLCanvas3D::update_sequential_clearance()
         if (v->is_modifier || v->is_wipe_tower)
             continue;
 
+        if (v->object_idx() < 0 || v->object_idx() >= (int)instance_transforms.size())
+            continue;
+        if (v->instance_idx() < 0 || v->instance_idx() >= (int)instance_transforms[v->object_idx()].size())
+            continue;
+
         auto& transform = instance_transforms[v->object_idx()][v->instance_idx()];
         if (!transform.has_value())
             transform = v->get_instance_transformation();
@@ -5602,12 +5641,12 @@ void GLCanvas3D::update_sequential_clearance()
     // the results are then cached for following displacements
     if (m_sequential_print_clearance_first_displacement) {
         m_sequential_print_clearance.m_hull_2d_cache.clear();
-        auto [object_skirt_offset, _] = fff_print()->object_skirt_offset();
+        auto [object_skirt_offset, _] = print->object_skirt_offset();
         float shrink_factor;
-        if (fff_print()->is_all_objects_are_short())
+        if (print->is_all_objects_are_short())
             shrink_factor = scale_(std::max(0.5f * MAX_OUTER_NOZZLE_DIAMETER, object_skirt_offset) - 0.1);
         else
-            shrink_factor = static_cast<float>(scale_(0.5 * fff_print()->config().extruder_clearance_radius.value + object_skirt_offset - 0.1));
+            shrink_factor = static_cast<float>(scale_(0.5 * print->config().extruder_clearance_radius.value + object_skirt_offset - 0.1));
 
         double mitter_limit = scale_(0.1);
         m_sequential_print_clearance.m_hull_2d_cache.reserve(m_model->objects.size());
@@ -5718,9 +5757,9 @@ void GLCanvas3D::update_sequential_clearance()
     }*/
 
     int bounding_box_count = convex_and_bounding_boxes.size();
-    double printable_height = fff_print()->config().printable_height;
-    double hc1 = fff_print()->config().extruder_clearance_height_to_lid;
-    double hc2 = fff_print()->config().extruder_clearance_height_to_rod;
+    double printable_height = print->config().printable_height;
+    double hc1 = print->config().extruder_clearance_height_to_lid;
+    double hc2 = print->config().extruder_clearance_height_to_rod;
     for (int k = 0; k < bounding_box_count; k++)
     {
         Polygon& convex = convex_and_bounding_boxes[k].hull_polygon;
@@ -10645,7 +10684,12 @@ void GLCanvas3D::highlight_gizmo(const std::string& gizmo_name)
 
 const Print* GLCanvas3D::fff_print() const
 {
-    return (m_process == nullptr) ? nullptr : m_process->fff_print();
+    Plater* plater = wxGetApp().plater();
+    if (plater == nullptr)
+        return nullptr;
+
+    PartPlate* curr_plate = plater->get_partplate_list().get_curr_plate();
+    return curr_plate != nullptr ? curr_plate->fff_print() : nullptr;
 }
 
 const SLAPrint* GLCanvas3D::sla_print() const
