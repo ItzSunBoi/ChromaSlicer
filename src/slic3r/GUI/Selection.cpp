@@ -2327,6 +2327,26 @@ void Selection::update_type()
     }
 
     bool requires_disable = false;
+    auto model_glvolume_count_for_instance = [this](int object_idx, int instance_idx) {
+        unsigned int count = 0;
+        for (const GLVolume* v : *m_volumes) {
+            if (v == nullptr || v->is_modifier || v->is_wipe_tower || v->volume_idx() < 0)
+                continue;
+            if (v->object_idx() == object_idx && v->instance_idx() == instance_idx)
+                ++count;
+        }
+        return count;
+    };
+    auto model_glvolume_count_for_object = [this](int object_idx) {
+        unsigned int count = 0;
+        for (const GLVolume* v : *m_volumes) {
+            if (v == nullptr || v->is_modifier || v->is_wipe_tower || v->volume_idx() < 0)
+                continue;
+            if (v->object_idx() == object_idx)
+                ++count;
+        }
+        return count;
+    };
 
     if (m_valid)
     {
@@ -2345,7 +2365,7 @@ void Selection::update_type()
             else
             {
                 const ModelObject* model_object = m_model->objects[first->object_idx()];
-                unsigned int volumes_count = (unsigned int)model_object->volumes.size();
+                unsigned int volumes_count = model_glvolume_count_for_instance(first->object_idx(), first->instance_idx());
                 unsigned int instances_count = (unsigned int)model_object->instances.size();
                 if (volumes_count * instances_count == 1)
                 {
@@ -2377,12 +2397,10 @@ void Selection::update_type()
 
             if (m_cache.content.size() == 1) // single object
             {
-                const ModelObject* model_object = m_model->objects[m_cache.content.begin()->first];
-                unsigned int model_volumes_count = (unsigned int)model_object->volumes.size();
+                unsigned int model_volumes_count = model_glvolume_count_for_object(m_cache.content.begin()->first);
 
-                unsigned int instances_count = (unsigned int)model_object->instances.size();
                 unsigned int selected_instances_count = (unsigned int)m_cache.content.begin()->second.size();
-                if (model_volumes_count * instances_count + sla_volumes_count == (unsigned int)m_list.size())
+                if (model_volumes_count + sla_volumes_count == (unsigned int)m_list.size())
                 {
                     m_type = SingleFullObject;
                     // ensures the correct mode is selected
@@ -2390,7 +2408,10 @@ void Selection::update_type()
                 }
                 else if (selected_instances_count == 1)
                 {
-                    if (model_volumes_count + sla_volumes_count == (unsigned int)m_list.size())
+                    const int selected_instance_idx = *m_cache.content.begin()->second.begin();
+                    const unsigned int selected_instance_model_volumes_count =
+                        model_glvolume_count_for_instance(m_cache.content.begin()->first, selected_instance_idx);
+                    if (selected_instance_model_volumes_count + sla_volumes_count == (unsigned int)m_list.size())
                     {
                         m_type = SingleFullInstance;
                         // ensures the correct mode is selected
@@ -2413,11 +2434,17 @@ void Selection::update_type()
                         requires_disable = true;
                     }
                 }
-                else if ((selected_instances_count > 1) && (selected_instances_count * model_volumes_count + sla_volumes_count == (unsigned int)m_list.size()))
+                else if (selected_instances_count > 1)
                 {
-                    m_type = MultipleFullInstance;
-                    // ensures the correct mode is selected
-                    m_mode = Instance;
+                    unsigned int selected_instances_model_volumes_count = 0;
+                    for (int selected_instance_idx : m_cache.content.begin()->second)
+                        selected_instances_model_volumes_count += model_glvolume_count_for_instance(m_cache.content.begin()->first, selected_instance_idx);
+
+                    if (selected_instances_model_volumes_count + sla_volumes_count == (unsigned int)m_list.size()) {
+                        m_type = MultipleFullInstance;
+                        // ensures the correct mode is selected
+                        m_mode = Instance;
+                    }
                 }
             }
             else
@@ -2427,10 +2454,14 @@ void Selection::update_type()
                 {
                     bool               is_wipe_tower   = it->first >= 1000;
                     int                actual_obj_id   = is_wipe_tower ? it->first - 1000 : it->first;
-                    const ModelObject *model_object    = m_model->objects[actual_obj_id];
-                    unsigned int volumes_count = (unsigned int)model_object->volumes.size();
-                    unsigned int instances_count = (unsigned int)model_object->instances.size();
-                    sels_cntr += volumes_count * instances_count;
+                    if (is_wipe_tower) {
+                        const ModelObject *model_object = m_model->objects[actual_obj_id];
+                        unsigned int volumes_count = (unsigned int)model_object->volumes.size();
+                        unsigned int instances_count = (unsigned int)model_object->instances.size();
+                        sels_cntr += volumes_count * instances_count;
+                    } else {
+                        sels_cntr += model_glvolume_count_for_object(actual_obj_id);
+                    }
                 }
                 if (sels_cntr + sla_volumes_count == (unsigned int)m_list.size())
                 {
