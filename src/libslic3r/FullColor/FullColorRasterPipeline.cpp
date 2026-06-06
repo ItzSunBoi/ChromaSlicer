@@ -1,6 +1,7 @@
 #include "FullColorRasterPipeline.hpp"
 
 #include "FullColorSurfaceData.hpp"
+#include "../ClipperUtils.hpp"
 #include "../Layer.hpp"
 #include "../Model.hpp"
 #include "../PNGReadWrite.hpp"
@@ -41,6 +42,7 @@ using RasterClock = std::chrono::steady_clock;
 
 static constexpr double FULL_COLOR_PIXEL_SIZE_MM        = 0.0846667; // ~300 DPI
 static constexpr double FULL_COLOR_NORMAL_TOLERANCE_MM = 0.02;
+static constexpr double FULL_COLOR_FDM_MASK_BLEED_MM   = FULL_COLOR_PIXEL_SIZE_MM * 1.5;
 static constexpr bool   FULL_COLOR_OBJ_FLIP_V          = true;
 static constexpr bool   FULL_COLOR_CPU_TEXTURE_FLIP_V  = false;
 static constexpr const char *FULL_COLOR_TEXTURE_ADDRESS_MODE = "clamp_to_edge";
@@ -128,6 +130,8 @@ struct LayerDebugCounters
     size_t closest_point_samples = 0;
     size_t rejected_by_xy_projection = 0;
     size_t rejected_by_shell_distance = 0;
+    size_t rejected_by_outward_shell = 0;
+    size_t rejected_by_fdm_mask = 0;
     size_t rejected_by_normal = 0;
     size_t invalid_uv_texture = 0;
 };
@@ -140,6 +144,14 @@ struct LayerPixelBounds
     int max_y = -1;
 
     bool empty() const { return max_x < min_x || max_y < min_y; }
+};
+
+struct LayerRasterMask
+{
+    ExPolygons printable_area;
+    std::vector<BoundingBox> bboxes;
+
+    bool empty() const { return printable_area.empty(); }
 };
 
 struct RasterTiming
@@ -172,6 +184,8 @@ static void add_counters(LayerDebugCounters &dst, const LayerDebugCounters &src)
     dst.closest_point_samples += src.closest_point_samples;
     dst.rejected_by_xy_projection += src.rejected_by_xy_projection;
     dst.rejected_by_shell_distance += src.rejected_by_shell_distance;
+    dst.rejected_by_outward_shell += src.rejected_by_outward_shell;
+    dst.rejected_by_fdm_mask += src.rejected_by_fdm_mask;
     dst.rejected_by_normal += src.rejected_by_normal;
     dst.invalid_uv_texture += src.invalid_uv_texture;
 }
@@ -515,6 +529,114 @@ static LayerPixelBounds layer_pixel_bounds(
     return bounds;
 }
 
+static Point scaled_point(const double x, const double y)
+{
+    return Point(scale_(x), scale_(y));
+}
+
+static bool contains_point(const LayerRasterMask &mask, const Point &point)
+{
+    for (size_t idx = 0; idx < mask.printable_area.size(); ++idx) {
+        if (idx < mask.bboxes.size() && !mask.bboxes[idx].contains(point))
+            continue;
+        if (mask.printable_area[idx].contains(point, true))
+            return true;
+    }
+    return false;
+}
+
+static void append_shifted_polygons(Polygons &dst, const Polygons &src, const Point &shift)
+{
+    const size_t start = dst.size();
+    append(dst, src);
+    for (size_t idx = start; idx < dst.size(); ++idx)
+        dst[idx].translate(shift);
+}
+
+static LayerRasterMask build_layer_fdm_mask(const Print &print, const LayerRasterInfo &layer)
+{
+    Polygons covered;
+    const float scaled_bleed = static_cast<float>(scale_(FULL_COLOR_FDM_MASK_BLEED_MM));
+
+    for (const PrintObject *object : print.objects()) {
+        if (object == nullptr)
+            continue;
+
+        const Layer *object_layer = object->get_layer_at_printz(layer.z1, 1e-5);
+        if (object_layer == nullptr)
+            continue;
+
+        Polygons object_polygons;
+        for (const LayerRegion *region : object_layer->regions()) {
+            if (region == nullptr)
+                continue;
+
+            region->perimeters.polygons_covered_by_width(object_polygons, scaled_bleed);
+            region->thin_fills.polygons_covered_by_width(object_polygons, scaled_bleed);
+            region->fills.polygons_covered_by_spacing(object_polygons, scaled_bleed);
+        }
+
+        if (object_polygons.empty())
+            continue;
+
+        for (const PrintInstance &instance : object->instances())
+            append_shifted_polygons(covered, object_polygons, instance.shift_without_plate_offset());
+    }
+
+    LayerRasterMask mask;
+    if (!covered.empty())
+        mask.printable_area = union_ex(covered);
+    mask.bboxes.reserve(mask.printable_area.size());
+    for (const ExPolygon &expoly : mask.printable_area)
+        mask.bboxes.emplace_back(get_extents(expoly));
+    return mask;
+}
+
+static LayerPixelBounds layer_mask_pixel_bounds(
+    const LayerRasterMask &mask,
+    const Vec3d &min_pt,
+    int width,
+    int height)
+{
+    LayerPixelBounds bounds;
+    bounds.min_x = width;
+    bounds.min_y = height;
+    bounds.max_x = -1;
+    bounds.max_y = -1;
+
+    for (const BoundingBox &bbox : mask.bboxes) {
+        const double min_x = unscale<double>(bbox.min.x());
+        const double max_x = unscale<double>(bbox.max.x());
+        const double min_y = unscale<double>(bbox.min.y());
+        const double max_y = unscale<double>(bbox.max.y());
+
+        const int x0 = std::clamp(static_cast<int>(std::floor((min_x - min_pt.x()) / FULL_COLOR_PIXEL_SIZE_MM)) - 1, 0, width - 1);
+        const int x1 = std::clamp(static_cast<int>(std::ceil ((max_x - min_pt.x()) / FULL_COLOR_PIXEL_SIZE_MM)) + 1, 0, width - 1);
+        const int y0 = std::clamp(static_cast<int>(std::floor((min_y - min_pt.y()) / FULL_COLOR_PIXEL_SIZE_MM)) - 1, 0, height - 1);
+        const int y1 = std::clamp(static_cast<int>(std::ceil ((max_y - min_pt.y()) / FULL_COLOR_PIXEL_SIZE_MM)) + 1, 0, height - 1);
+
+        bounds.min_x = std::min(bounds.min_x, x0);
+        bounds.max_x = std::max(bounds.max_x, x1);
+        bounds.min_y = std::min(bounds.min_y, y0);
+        bounds.max_y = std::max(bounds.max_y, y1);
+    }
+
+    return bounds;
+}
+
+static LayerPixelBounds intersect_bounds(const LayerPixelBounds &a, const LayerPixelBounds &b)
+{
+    if (a.empty() || b.empty())
+        return {};
+
+    LayerPixelBounds out;
+    out.min_x = std::max(a.min_x, b.min_x);
+    out.max_x = std::min(a.max_x, b.max_x);
+    out.min_y = std::max(a.min_y, b.min_y);
+    out.max_y = std::min(a.max_y, b.max_y);
+    return out;
+}
+
 static bool sample_best_triangle(
     const std::vector<RasterTriangle> &triangles,
     const std::vector<TextureBitmap> &textures,
@@ -562,6 +684,20 @@ static bool sample_best_triangle(
         const double normal_distance = delta.dot(tri.normal);
         if (normal_distance > FULL_COLOR_NORMAL_TOLERANCE_MM) {
             ++counters.rejected_by_normal;
+            continue;
+        }
+
+        const double inward_depth = -normal_distance;
+        if (inward_depth > shell_thickness) {
+            ++counters.rejected_by_shell_distance;
+            continue;
+        }
+
+        // The color shell is only the material band inside the model surface.
+        // Closest-point hits on triangle edges can otherwise color pixels outside
+        // sharp corners because their offset is tangential to the triangle normal.
+        if (!used_vertical_projection && inward_depth < FULL_COLOR_NORMAL_TOLERANCE_MM) {
+            ++counters.rejected_by_outward_shell;
             continue;
         }
 
@@ -887,7 +1023,9 @@ static void write_debug_log(
     out << "triangle_mapping_strategy=mesh triangle index matched to FullColor::SurfaceData::triangles index\n";
     out << "triangle_mapping_validated=" << (triangle_mapping_validated ? "true" : "false") << "\n";
     out << "coordinate_space=slicer object space with PrintInstance::shift_without_plate_offset applied in XY\n";
-    out << "raster_strategy=vertical-layer-projection-with-closest-point-fallback-uniform-grid\n";
+    out << "raster_strategy=vertical-layer-projection-with-closest-point-fallback-uniform-grid-fdm-mask\n";
+    out << "raster_clip=actual-fdm-extrusion-mask\n";
+    out << "fdm_mask_source=LayerRegion perimeters/fills/thin_fills polygons_covered_by_width_or_spacing\n";
     out << "debug_mode=" << raster_debug_mode_name(debug_mode) << "\n";
     out << "texture_sampling=bilinear\n";
     out << "uv_flip_v=" << (FULL_COLOR_OBJ_FLIP_V ? "true" : "false") << "\n";
@@ -895,6 +1033,7 @@ static void write_debug_log(
     out << "texture_address_mode=" << FULL_COLOR_TEXTURE_ADDRESS_MODE << "\n";
     out << "texture_buffer_origin=" << FULL_COLOR_TEXTURE_BUFFER_ORIGIN << "\n";
     out << "pixel_size_mm=" << FULL_COLOR_PIXEL_SIZE_MM << "\n";
+    out << "fdm_mask_bleed_mm=" << FULL_COLOR_FDM_MASK_BLEED_MM << "\n";
     out << "shell_thickness_mm=" << shell_thickness << "\n";
     out << "normal_tolerance_mm=" << FULL_COLOR_NORMAL_TOLERANCE_MM << "\n";
     out << "triangle_count=" << triangle_count << "\n";
@@ -998,7 +1137,8 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
     BOOST_LOG_TRIVIAL(info) << "FullColor Raster: pixel_size=" << FULL_COLOR_PIXEL_SIZE_MM << " mm";
     BOOST_LOG_TRIVIAL(info) << "FullColor Raster: shell_thickness=" << shell_thickness << " mm";
     BOOST_LOG_TRIVIAL(info) << "FullColor Raster: shell_mode=normal-inward";
-    BOOST_LOG_TRIVIAL(info) << "FullColor Raster: raster_strategy=vertical-layer-projection-with-closest-point-fallback-uniform-grid";
+    BOOST_LOG_TRIVIAL(info) << "FullColor Raster: raster_strategy=vertical-layer-projection-with-closest-point-fallback-uniform-grid-fdm-mask";
+    BOOST_LOG_TRIVIAL(info) << "FullColor Raster: fdm_mask_bleed=" << FULL_COLOR_FDM_MASK_BLEED_MM << " mm";
     BOOST_LOG_TRIVIAL(info) << "FullColor Raster: debug_mode=" << raster_debug_mode_name(debug_mode);
 
     std::vector<RasterTriangle> triangles;
@@ -1203,9 +1343,12 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
         {"enable_full_color_printing", true},
         {"full_color_shell_thickness_mm", shell_thickness},
         {"full_color_pixel_size_mm", FULL_COLOR_PIXEL_SIZE_MM},
+        {"fdm_mask_bleed_mm", FULL_COLOR_FDM_MASK_BLEED_MM},
         {"normal_tolerance_mm", FULL_COLOR_NORMAL_TOLERANCE_MM},
         {"shell_mode", "normal-inward"},
-        {"raster_strategy", "vertical-layer-projection-with-closest-point-fallback-uniform-grid"},
+        {"raster_strategy", "vertical-layer-projection-with-closest-point-fallback-uniform-grid-fdm-mask"},
+        {"raster_clip", "actual-fdm-extrusion-mask"},
+        {"fdm_mask_source", "LayerRegion perimeters/fills/thin_fills polygons_covered_by_width_or_spacing"},
         {"texture_sampling", "bilinear"},
         {"uv_flip_v", FULL_COLOR_OBJ_FLIP_V},
         {"cpu_texture_v_flip", FULL_COLOR_CPU_TEXTURE_FLIP_V},
@@ -1281,10 +1424,13 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
         LayerDebugCounters counters;
         counters.total_pixels = static_cast<size_t>(width) * static_cast<size_t>(height);
         std::vector<std::uint8_t> image(static_cast<size_t>(width) * static_cast<size_t>(height) * 3, 255);
-        const LayerPixelBounds active_bounds = layer_pixel_bounds(triangles, min_pt, width, height, layer.sample_z, shell_thickness);
+        const LayerRasterMask fdm_mask = build_layer_fdm_mask(print, layer);
+        const LayerPixelBounds color_bounds = layer_pixel_bounds(triangles, min_pt, width, height, layer.sample_z, shell_thickness);
+        const LayerPixelBounds mask_bounds = layer_mask_pixel_bounds(fdm_mask, min_pt, width, height);
+        const LayerPixelBounds active_bounds = intersect_bounds(color_bounds, mask_bounds);
         std::vector<LayerDebugCounters> row_counters(static_cast<size_t>(height));
 
-        if (!active_bounds.empty()) {
+        if (!fdm_mask.empty() && !active_bounds.empty()) {
             tbb::parallel_for(
                 tbb::blocked_range<int>(active_bounds.min_y, active_bounds.max_y + 1, 8),
                 [&](const tbb::blocked_range<int> &range) {
@@ -1296,6 +1442,10 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
                                 min_pt.x() + (x + 0.5) * FULL_COLOR_PIXEL_SIZE_MM,
                                 py,
                                 layer.sample_z);
+                            if (!contains_point(fdm_mask, scaled_point(query.x(), query.y()))) {
+                                ++local.rejected_by_fdm_mask;
+                                continue;
+                            }
 
                             RGBA color{1.0f, 1.0f, 1.0f, 1.0f};
                             if (sample_pixel_color(triangles, textures, triangle_grid, query, shell_thickness, debug_mode, local, color)) {
@@ -1353,9 +1503,12 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
         layer_json["config"] = {
             {"enable_full_color_printing", true},
             {"full_color_shell_thickness_mm", shell_thickness},
+            {"fdm_mask_bleed_mm", FULL_COLOR_FDM_MASK_BLEED_MM},
             {"normal_tolerance_mm", FULL_COLOR_NORMAL_TOLERANCE_MM},
             {"shell_mode", "normal-inward"},
-            {"raster_strategy", "vertical-layer-projection-with-closest-point-fallback-uniform-grid"},
+            {"raster_strategy", "vertical-layer-projection-with-closest-point-fallback-uniform-grid-fdm-mask"},
+            {"raster_clip", "actual-fdm-extrusion-mask"},
+            {"fdm_mask_source", "LayerRegion perimeters/fills/thin_fills polygons_covered_by_width_or_spacing"},
             {"texture_sampling", "bilinear"},
             {"uv_flip_v", FULL_COLOR_OBJ_FLIP_V},
             {"cpu_texture_v_flip", FULL_COLOR_CPU_TEXTURE_FLIP_V},
@@ -1379,11 +1532,23 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
                 {"min_y", active_bounds.min_y},
                 {"max_y", active_bounds.max_y}
             }},
+            {"color_bounds_empty", color_bounds.empty()},
+            {"fdm_mask_empty", fdm_mask.empty()},
+            {"fdm_mask_expolygon_count", fdm_mask.printable_area.size()},
+            {"fdm_mask_bbox_count", fdm_mask.bboxes.size()},
+            {"fdm_mask_bounds_px", mask_bounds.empty() ? json(nullptr) : json{
+                {"min_x", mask_bounds.min_x},
+                {"max_x", mask_bounds.max_x},
+                {"min_y", mask_bounds.min_y},
+                {"max_y", mask_bounds.max_y}
+            }},
             {"layer_raster_time_ms", layer_ms},
             {"vertical_projected_samples", counters.vertical_projected_samples},
             {"closest_point_samples", counters.closest_point_samples},
             {"rejected_by_xy_projection", counters.rejected_by_xy_projection},
             {"rejected_by_shell_distance", counters.rejected_by_shell_distance},
+            {"rejected_by_outward_shell", counters.rejected_by_outward_shell},
+            {"rejected_by_fdm_mask", counters.rejected_by_fdm_mask},
             {"rejected_by_normal", counters.rejected_by_normal},
             {"invalid_uv_texture", counters.invalid_uv_texture}
         };
@@ -1407,6 +1572,7 @@ RasterPipelineOutput generate_full_color_rasters(const Print &print, const std::
             {"z1_mm", layer.z1},
             {"sample_z_mm", layer.sample_z},
             {"colored_pixels", counters.colored_pixels},
+            {"fdm_mask_empty", fdm_mask.empty()},
             {"layer_raster_time_ms", layer_ms},
             {"png", (boost::filesystem::path("layers") / png_path.filename()).string()},
             {"metadata", (boost::filesystem::path("layer_metadata") / json_path.filename()).string()}
